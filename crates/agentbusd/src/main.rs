@@ -120,21 +120,31 @@ where
     .await?
 }
 
-/// Write a response to the client, framed with a trailing newline.
-async fn write_response(
-    writer: &mut (impl AsyncWriteExt + Unpin),
-    resp: &BusResponse,
-) -> anyhow::Result<()> {
-    let mut buf = serde_json::to_vec(resp)?;
-    buf.push(b'\n');
-    writer.write_all(&buf).await?;
-    writer.flush().await?;
-    Ok(())
+/// Abstraction over the socket write path so unit tests can inject a
+/// writer that fails on demand. This is the seam for the F-011 / J-006
+/// write-failure tests: a test implementation can be swapped in without
+/// touching the rest of the daemon. `async fn in trait` (stable since
+/// Rust 1.75) keeps us free of the `async-trait` crate.
+trait MessageWriter: Send + Unpin {
+    async fn write_response(&mut self, resp: &BusResponse) -> anyhow::Result<()>;
+}
+
+/// Real production impl: frame the response with a trailing newline and
+/// write it to the underlying socket half.
+impl MessageWriter for tokio::net::unix::OwnedWriteHalf {
+    async fn write_response(&mut self, resp: &BusResponse) -> anyhow::Result<()> {
+        let mut buf = serde_json::to_vec(resp)?;
+        buf.push(b'\n');
+        self.write_all(&buf).await?;
+        self.flush().await?;
+        Ok(())
+    }
 }
 
 /// Outcome of one iteration of the `handle_client` loop. The inner function
 /// uses a custom enum so a `select!` branch can tell us to exit cleanly vs.
 /// keep looping without abusing `?` / sentinel errors.
+#[derive(Debug)]
 enum LoopOutcome {
     Continue,
     Exit,
@@ -144,16 +154,23 @@ enum LoopOutcome {
 /// request from the socket, or deliver one pushed message. Extracted from
 /// `handle_client` to drop its complexity score from ~14 to ~8 and to make
 /// the logic reachable from unit tests with a custom writer.
+///
+/// Generic over the reader and writer so tests can inject `FailingWriter`
+/// without wiring up a real Unix socket writer.
 #[allow(clippy::too_many_arguments)]
-async fn handle_one_iteration(
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+async fn handle_one_iteration<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
     db: &DbHandle,
     clients: &ClientMap,
     agent_name: &mut Option<String>,
     rx: &mut Option<mpsc::Receiver<agentbus_core::Message>>,
     line_buf: &mut String,
-) -> anyhow::Result<LoopOutcome> {
+) -> anyhow::Result<LoopOutcome>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: MessageWriter,
+{
     line_buf.clear();
 
     // Prepare a future for pushed messages. When we're not registered,
@@ -196,7 +213,7 @@ async fn handle_one_iteration(
                     let resp = BusResponse::Error {
                         message: format!("Parse error: {}", e),
                     };
-                    write_response(writer, &resp).await?;
+                    writer.write_response(&resp).await?;
                     return Ok(LoopOutcome::Continue);
                 }
             };
@@ -212,7 +229,7 @@ async fn handle_one_iteration(
             .await?;
 
             if let Some(resp) = response {
-                write_response(writer, &resp).await?;
+                writer.write_response(&resp).await?;
             }
             Ok(LoopOutcome::Continue)
         }
@@ -229,7 +246,7 @@ async fn handle_one_iteration(
             // Deliver-then-mark-read (Issue 1). If the write fails, we
             // release the claim so the next connection redelivers.
             let resp = BusResponse::Message { message: msg.clone() };
-            match write_response(writer, &resp).await {
+            match writer.write_response(&resp).await {
                 Ok(()) => {
                     let msg_id = msg.id.clone();
                     if let Err(e) = db_call(db, move |d| d.mark_read(&msg_id)).await {
@@ -283,13 +300,13 @@ async fn handle_client(
 /// response should be written back, or `Ok(None)` if the handler already
 /// wrote its own response (e.g. the Read/wait branch).
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_request(
+async fn dispatch_request<W: MessageWriter>(
     request: BusRequest,
     db: &DbHandle,
     clients: &ClientMap,
     agent_name: &mut Option<String>,
     rx: &mut Option<mpsc::Receiver<agentbus_core::Message>>,
-    writer: &mut (impl AsyncWriteExt + Unpin),
+    writer: &mut W,
 ) -> anyhow::Result<Option<BusResponse>> {
     let response = match request {
         BusRequest::Register {
@@ -479,7 +496,7 @@ async fn dispatch_request(
                         let resp = BusResponse::Ok {
                             data: serde_json::to_value(&messages)?,
                         };
-                        match write_response(writer, &resp).await {
+                        match writer.write_response(&resp).await {
                             Ok(()) => {
                                 for msg in &messages {
                                     let mid = msg.id.clone();
@@ -532,7 +549,7 @@ async fn dispatch_request(
                         Some(msg) => {
                             // Deliver-then-mark-read for the wait path too.
                             let resp = BusResponse::Message { message: msg.clone() };
-                            match write_response(writer, &resp).await {
+                            match writer.write_response(&resp).await {
                                 Ok(()) => {
                                     let mid = msg.id.clone();
                                     if let Err(e) =
@@ -588,4 +605,266 @@ async fn dispatch_request(
     };
 
     Ok(Some(response))
+}
+
+// ===========================================================================
+// Unit tests — exercise the previously-untestable write-failure paths
+// (F-011 claim released after Read-response write failure, J-006 pushed-branch
+// write failure releases claim) by driving `handle_one_iteration` with a
+// `FailingWriter` that simulates a socket error on the first response write.
+//
+// These tests live inside `main.rs` (not integration tests) because the
+// `MessageWriter` trait and `handle_one_iteration` are crate-private to the
+// binary, and integration tests compile as separate binaries that can't see
+// private items of a binary crate. Putting them here is the path the Risk
+// Profile Refactor 2 / 3 guidance explicitly calls out.
+// ===========================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentbus_core::{Message, MessageType};
+    use serial_test::serial;
+    use std::sync::Mutex as StdMutex;
+    use tempfile::TempDir;
+    use tokio::net::UnixStream;
+
+    /// `MessageWriter` implementation that fails on the first write and
+    /// records any successful writes into an inner Vec for inspection.
+    /// Using a plain `usize` counter (not AtomicUsize) because `write_response`
+    /// takes `&mut self` — exclusive access makes atomics pointless.
+    struct FailingWriter {
+        remaining: StdMutex<usize>,
+        writes: StdMutex<Vec<BusResponse>>,
+    }
+
+    impl FailingWriter {
+        fn new(fail_after: usize) -> Self {
+            Self {
+                remaining: StdMutex::new(fail_after),
+                writes: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn take_writes(&self) -> Vec<BusResponse> {
+            std::mem::take(&mut *self.writes.lock().unwrap())
+        }
+    }
+
+    impl MessageWriter for FailingWriter {
+        async fn write_response(&mut self, resp: &BusResponse) -> anyhow::Result<()> {
+            let mut rem = self.remaining.lock().unwrap();
+            if *rem == 0 {
+                return Err(anyhow::anyhow!("simulated write failure"));
+            }
+            *rem -= 1;
+            self.writes.lock().unwrap().push(resp.clone());
+            Ok(())
+        }
+    }
+
+    /// Create an isolated DB rooted at `<tmp>/.agentbus`, like the Tier 2
+    /// database tests. Returns (db_handle, tmp). Caller must keep the tmp
+    /// alive for the duration of the test.
+    fn fresh_db_handle() -> (DbHandle, TempDir) {
+        let tmp = tempfile::TempDir::new_in("/tmp").expect("tempdir");
+        std::env::set_var("AGENTBUS_DIR", tmp.path().join(".agentbus"));
+        let _ = std::fs::remove_dir_all(tmp.path().join(".agentbus"));
+        let db = Database::init().expect("Database::init");
+        (Arc::new(Mutex::new(db)), tmp)
+    }
+
+    /// Look up `claimed_at` for a given message id via a fresh raw connection.
+    fn claimed_at_for(tmp: &TempDir, msg_id: &str) -> Option<String> {
+        use rusqlite::Connection;
+        let path = tmp.path().join(".agentbus").join("bus.db");
+        let conn = Connection::open(path).expect("raw conn");
+        conn.query_row(
+            "SELECT claimed_at FROM messages WHERE id = ?",
+            rusqlite::params![msg_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .expect("query claimed_at")
+    }
+
+    // -------------------------------------------------------------------
+    // J-006 — pushed-branch write failure releases claim
+    //
+    // Setup: bob is registered and has a push channel. A message for bob is
+    // inserted into the DB and claimed (mirroring what the Send path does
+    // right before it calls try_send on the push tx). We push the message
+    // into the mpsc, then drive one iteration with a FailingWriter. The
+    // pushed branch should win the select!, attempt to write, fail, release
+    // the claim, and return Err.
+    // -------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn j006_push_branch_write_failure_releases_claim() {
+        let (db, tmp) = fresh_db_handle();
+
+        // Seed agents + message (borrow the mutex just for the setup).
+        let msg = {
+            let guard = db.lock().await;
+            guard.register_agent("alice", "p", "m", "proj").unwrap();
+            guard.register_agent("bob", "p", "m", "proj").unwrap();
+            guard
+                .send_message("alice", "bob", None, MessageType::Request, "hi")
+                .unwrap()
+        };
+
+        // Simulate the daemon Send path: claim the message before pushing.
+        {
+            let guard = db.lock().await;
+            assert!(guard.claim_message(&msg.id).unwrap());
+        }
+        assert!(claimed_at_for(&tmp, &msg.id).is_some(), "setup: should be claimed");
+
+        // Build the iteration harness state. The reader half of a UnixStream
+        // pair that nobody writes to yields a pending read_line — so the
+        // pushed branch reliably wins the select!.
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<Message>(PUSH_CHANNEL_CAPACITY);
+        let mut rx_opt: Option<mpsc::Receiver<Message>> = Some(rx);
+
+        // Push the message so it's waiting for the next select! poll.
+        tx.send(msg.clone()).await.expect("push");
+
+        // Register bob in the map just to match production state (not
+        // strictly required for the pushed branch to work, but keeps the
+        // shape of the test realistic).
+        {
+            let mut map = clients.lock().await;
+            map.insert("bob".to_string(), tx);
+        }
+        let mut agent_name: Option<String> = Some("bob".to_string());
+
+        // Reader that pends forever.
+        let (_peer, ours) = UnixStream::pair().expect("unix pair");
+        let (read_half, _write_half) = ours.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let mut writer = FailingWriter::new(0); // first write fails
+        let mut line = String::new();
+
+        let result = handle_one_iteration(
+            &mut reader,
+            &mut writer,
+            &db,
+            &clients,
+            &mut agent_name,
+            &mut rx_opt,
+            &mut line,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "expected Err from failed pushed write, got {result:?}"
+        );
+        // Give the db_call spawn_blocking a beat to commit the release.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            claimed_at_for(&tmp, &msg.id).is_none(),
+            "claim should be released after pushed-branch write failure"
+        );
+        // FailingWriter never succeeded.
+        assert!(writer.take_writes().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // F-011 — Read-path write failure releases all claims
+    //
+    // Setup: bob has three unread messages in the DB. A Read(wait=false)
+    // request is queued in the socket-pair read half. We drive one iteration
+    // with a FailingWriter. handle_one_iteration should:
+    //   - parse the Read request,
+    //   - dispatch it (Phase A: fetch_and_claim_messages claims all three),
+    //   - attempt the response write (Phase B), which fails,
+    //   - release the three claims,
+    //   - propagate the Err.
+    // -------------------------------------------------------------------
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn f011_claim_released_after_write_failure() {
+        let (db, tmp) = fresh_db_handle();
+
+        let msg_ids: Vec<String> = {
+            let guard = db.lock().await;
+            guard.register_agent("alice", "p", "m", "proj").unwrap();
+            guard.register_agent("bob", "p", "m", "proj").unwrap();
+            (0..3)
+                .map(|i| {
+                    guard
+                        .send_message(
+                            "alice",
+                            "bob",
+                            None,
+                            MessageType::Request,
+                            &format!("m{i}"),
+                        )
+                        .unwrap()
+                        .id
+                })
+                .collect()
+        };
+
+        // Client map must contain bob so agent_name resolves the receiver
+        // for the Read branch. We don't actually use the push rx here — the
+        // Read request's non-wait path takes the direct DB fetch branch.
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = mpsc::channel::<Message>(PUSH_CHANNEL_CAPACITY);
+        let mut rx_opt: Option<mpsc::Receiver<Message>> = Some(rx);
+        {
+            let mut map = clients.lock().await;
+            map.insert("bob".to_string(), tx);
+        }
+        let mut agent_name: Option<String> = Some("bob".to_string());
+
+        // Queue a Read request in the socket pair. Use a real pair so that
+        // the read_line future makes progress before the pushed branch
+        // becomes runnable (the pushed branch has no sender, so it pends).
+        let (peer, ours) = UnixStream::pair().expect("unix pair");
+        let read_req = BusRequest::Read {
+            wait: Some(false),
+            timeout_secs: None,
+        };
+        let line = serde_json::to_string(&read_req).unwrap() + "\n";
+        // Write from the peer side so our reader sees it.
+        {
+            let (_pr, mut pw) = peer.into_split();
+            pw.write_all(line.as_bytes()).await.unwrap();
+            pw.flush().await.unwrap();
+        }
+
+        let (read_half, _write_half) = ours.into_split();
+        let mut reader = BufReader::new(read_half);
+
+        let mut writer = FailingWriter::new(0); // first write fails
+        let mut line_buf = String::new();
+
+        let result = handle_one_iteration(
+            &mut reader,
+            &mut writer,
+            &db,
+            &clients,
+            &mut agent_name,
+            &mut rx_opt,
+            &mut line_buf,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "expected Err from failed Read-path write, got {result:?}"
+        );
+        // Release claims run through db_call → spawn_blocking; let them
+        // commit before we inspect the DB.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for id in &msg_ids {
+            assert!(
+                claimed_at_for(&tmp, id).is_none(),
+                "claim for {id} should have been released after write failure"
+            );
+        }
+        assert!(writer.take_writes().is_empty());
+    }
 }

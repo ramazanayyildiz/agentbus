@@ -164,7 +164,7 @@ pub enum BusRequest {
 }
 
 /// Daemon → Client protocol
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BusResponse {
     Ok {
