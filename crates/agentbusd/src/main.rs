@@ -132,6 +132,124 @@ async fn write_response(
     Ok(())
 }
 
+/// Outcome of one iteration of the `handle_client` loop. The inner function
+/// uses a custom enum so a `select!` branch can tell us to exit cleanly vs.
+/// keep looping without abusing `?` / sentinel errors.
+enum LoopOutcome {
+    Continue,
+    Exit,
+}
+
+/// Drive a single iteration of the client loop: either read and dispatch one
+/// request from the socket, or deliver one pushed message. Extracted from
+/// `handle_client` to drop its complexity score from ~14 to ~8 and to make
+/// the logic reachable from unit tests with a custom writer.
+#[allow(clippy::too_many_arguments)]
+async fn handle_one_iteration(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    db: &DbHandle,
+    clients: &ClientMap,
+    agent_name: &mut Option<String>,
+    rx: &mut Option<mpsc::Receiver<agentbus_core::Message>>,
+    line_buf: &mut String,
+) -> anyhow::Result<LoopOutcome> {
+    line_buf.clear();
+
+    // Prepare a future for pushed messages. When we're not registered,
+    // this future is `pending` forever so the select! still works.
+    let pushed = async {
+        match rx.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending::<Option<agentbus_core::Message>>().await,
+        }
+    };
+
+    tokio::select! {
+        // === Branch 1: incoming request from client ===
+        read_res = reader.read_line(line_buf) => {
+            let n = read_res?;
+            if n == 0 {
+                // Client disconnected — release any claims and the push
+                // channel slot.
+                if let Some(ref name) = agent_name {
+                    {
+                        let mut map = clients.lock().await;
+                        map.remove(name);
+                    }
+                    let name_clone = name.clone();
+                    let _ = db_call(db, move |d| d.release_all_claims_for(&name_clone)).await;
+                    info!("Agent {} disconnected", name);
+                }
+                return Ok(LoopOutcome::Exit);
+            }
+
+            let trimmed = line_buf.trim();
+            if trimmed.is_empty() {
+                return Ok(LoopOutcome::Continue);
+            }
+
+            // Parse request
+            let request: BusRequest = match serde_json::from_str(trimmed) {
+                Ok(req) => req,
+                Err(e) => {
+                    let resp = BusResponse::Error {
+                        message: format!("Parse error: {}", e),
+                    };
+                    write_response(writer, &resp).await?;
+                    return Ok(LoopOutcome::Continue);
+                }
+            };
+
+            let response = dispatch_request(
+                request,
+                db,
+                clients,
+                agent_name,
+                rx,
+                writer,
+            )
+            .await?;
+
+            if let Some(resp) = response {
+                write_response(writer, &resp).await?;
+            }
+            Ok(LoopOutcome::Continue)
+        }
+
+        // === Branch 2: pushed message from another agent ===
+        maybe_msg = pushed => {
+            let Some(msg) = maybe_msg else {
+                // Sender dropped — other end of the channel is gone.
+                // Clear our receiver so the branch becomes pending again.
+                *rx = None;
+                return Ok(LoopOutcome::Continue);
+            };
+
+            // Deliver-then-mark-read (Issue 1). If the write fails, we
+            // release the claim so the next connection redelivers.
+            let resp = BusResponse::Message { message: msg.clone() };
+            match write_response(writer, &resp).await {
+                Ok(()) => {
+                    let msg_id = msg.id.clone();
+                    if let Err(e) = db_call(db, move |d| d.mark_read(&msg_id)).await {
+                        warn!("mark_read failed for pushed msg: {}", e);
+                    }
+                    Ok(LoopOutcome::Continue)
+                }
+                Err(e) => {
+                    warn!("Push write failed ({}); releasing claim {}", e, msg.id);
+                    let msg_id = msg.id.clone();
+                    let _ = db_call(db, move |d| d.release_claim(&msg_id)).await;
+                    // Client socket is broken — propagate the error so
+                    // the task ends and cleanup runs.
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
 async fn handle_client(
     socket: UnixStream,
     db: DbHandle,
@@ -143,101 +261,20 @@ async fn handle_client(
     let mut agent_name: Option<String> = None;
     let mut rx: Option<mpsc::Receiver<agentbus_core::Message>> = None;
 
-    // Outcome of draining one line from the socket. The inner loop uses a
-    // custom enum so a `select!` branch can tell us to exit cleanly vs. keep
-    // looping without propagating through `?`.
     loop {
-        line.clear();
-
-        // Prepare a future for pushed messages. When we're not registered,
-        // this future is `pending` forever so the select! still works.
-        let pushed = async {
-            match rx.as_mut() {
-                Some(rx) => rx.recv().await,
-                None => std::future::pending::<Option<agentbus_core::Message>>().await,
-            }
-        };
-
-        tokio::select! {
-            // === Branch 1: incoming request from client ===
-            read_res = reader.read_line(&mut line) => {
-                let n = read_res?;
-                if n == 0 {
-                    // Client disconnected — release any claims and the push
-                    // channel slot.
-                    if let Some(ref name) = agent_name {
-                        {
-                            let mut map = clients.lock().await;
-                            map.remove(name);
-                        }
-                        let name_clone = name.clone();
-                        let _ = db_call(&db, move |d| d.release_all_claims_for(&name_clone)).await;
-                        info!("Agent {} disconnected", name);
-                    }
-                    return Ok(());
-                }
-
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                // Parse request
-                let request: BusRequest = match serde_json::from_str(trimmed) {
-                    Ok(req) => req,
-                    Err(e) => {
-                        let resp = BusResponse::Error {
-                            message: format!("Parse error: {}", e),
-                        };
-                        write_response(&mut writer, &resp).await?;
-                        continue;
-                    }
-                };
-
-                let response = dispatch_request(
-                    request,
-                    &db,
-                    &clients,
-                    &mut agent_name,
-                    &mut rx,
-                    &mut writer,
-                )
-                .await?;
-
-                if let Some(resp) = response {
-                    write_response(&mut writer, &resp).await?;
-                }
-            }
-
-            // === Branch 2: pushed message from another agent ===
-            maybe_msg = pushed => {
-                let Some(msg) = maybe_msg else {
-                    // Sender dropped — other end of the channel is gone.
-                    // Clear our receiver so the branch becomes pending again.
-                    rx = None;
-                    continue;
-                };
-
-                // Deliver-then-mark-read (Issue 1). If the write fails, we
-                // release the claim so the next connection redelivers.
-                let resp = BusResponse::Message { message: msg.clone() };
-                match write_response(&mut writer, &resp).await {
-                    Ok(()) => {
-                        let msg_id = msg.id.clone();
-                        if let Err(e) = db_call(&db, move |d| d.mark_read(&msg_id)).await {
-                            warn!("mark_read failed for pushed msg: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Push write failed ({}); releasing claim {}", e, msg.id);
-                        let msg_id = msg.id.clone();
-                        let _ = db_call(&db, move |d| d.release_claim(&msg_id)).await;
-                        // Client socket is broken — propagate the error so
-                        // the task ends and cleanup runs.
-                        return Err(e);
-                    }
-                }
-            }
+        match handle_one_iteration(
+            &mut reader,
+            &mut writer,
+            &db,
+            &clients,
+            &mut agent_name,
+            &mut rx,
+            &mut line,
+        )
+        .await?
+        {
+            LoopOutcome::Continue => continue,
+            LoopOutcome::Exit => return Ok(()),
         }
     }
 }
