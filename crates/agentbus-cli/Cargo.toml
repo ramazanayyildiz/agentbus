@@ -1,0 +1,19 @@
+[package]
+name = "agentbus-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "agentbus"
+path = "src/main.rs"
+
+[dependencies]
+agentbus-core = { path = "../agentbus-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+clap = { workspace = true }
+anyhow = { workspace = true }
+dirs = "5"
+nix = { version = "0.28", features = ["signal"] }

@@ -1,0 +1,24 @@
+[package]
+name = "agentbus-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+dirs = "5"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+serial_test = "3"
+
+[lib]
