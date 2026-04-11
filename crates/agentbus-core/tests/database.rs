@@ -2,16 +2,16 @@
 //!
 //! Covers Test Plan cases M-001 .. M-012.
 //!
-//! ## HOME isolation
+//! ## Isolation
 //!
-//! `Database::init()` calls `dirs::home_dir()` which reads the process-global
-//! `HOME` env var. Cargo runs tests in parallel inside a single process, so we
-//! use `serial_test::serial` on every test that touches `HOME` to make the
-//! env manipulation safe. Each test creates its own `tempfile::TempDir` and
-//! points `HOME` at it for the duration of the test.
+//! `Database::init()` now honours the `AGENTBUS_DIR` env var, which points
+//! directly at the `.agentbus` directory to use. Tests still mutate a
+//! process-global env var, so we keep `serial_test::serial` on every test
+//! that touches it. Each test creates its own `tempfile::TempDir` and points
+//! `AGENTBUS_DIR` at `<tmp>/.agentbus` for the duration of the test.
 //!
 //! Each test also opens a separate raw `rusqlite::Connection` against the
-//! created `~/.agentbus/agentbus.db` for read-only assertions (checking
+//! created `<tmp>/.agentbus/bus.db` for read-only assertions (checking
 //! `read_at`, `claimed_at`, etc. directly).
 
 use agentbus_core::{AgentState, Database, MessageType};
@@ -26,8 +26,10 @@ fn fresh_db() -> (Database, TempDir) {
     // Force tempdir into /tmp so we're on a real local filesystem (iCloud-
     // backed directories can't host SQLite databases reliably).
     let tmp = tempfile::TempDir::new_in("/tmp").expect("create tempdir in /tmp");
-    std::env::set_var("HOME", tmp.path());
-    // Defensive cleanup in case a prior test leaked into this HOME.
+    // Point the core `agentbus_dir()` helper at this test's tempdir via
+    // `AGENTBUS_DIR`. Still process-global, hence `#[serial]` on tests.
+    std::env::set_var("AGENTBUS_DIR", tmp.path().join(".agentbus"));
+    // Defensive cleanup in case a prior test leaked into this dir.
     let _ = std::fs::remove_dir_all(tmp.path().join(".agentbus"));
     let db = Database::init().expect("Database::init");
     (db, tmp)

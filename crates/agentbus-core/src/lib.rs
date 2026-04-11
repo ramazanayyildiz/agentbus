@@ -184,11 +184,12 @@ pub struct Database {
 }
 
 impl Database {
-    /// Initialize database, create ~/.agentbus directory and db file
+    /// Initialize database, create ~/.agentbus directory and db file.
+    ///
+    /// Honours the `AGENTBUS_DIR` env var if set (used by tests for full
+    /// per-process isolation); otherwise falls back to `~/.agentbus`.
     pub fn init() -> anyhow::Result<Self> {
-        let db_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".agentbus");
+        let db_dir = agentbus_dir()?;
 
         fs::create_dir_all(&db_dir)?;
 
@@ -560,8 +561,17 @@ impl Database {
     }
 }
 
-/// Helper to get agentbus directory path
+/// Helper to get agentbus directory path.
+///
+/// Respects `AGENTBUS_DIR` if set so integration and unit tests can point each
+/// spawned daemon or in-process `Database` at an isolated tempdir without
+/// mutating process-global `HOME`. Falls back to `~/.agentbus`.
 pub fn agentbus_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("AGENTBUS_DIR") {
+        if !override_dir.is_empty() {
+            return Ok(PathBuf::from(override_dir));
+        }
+    }
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(".agentbus");

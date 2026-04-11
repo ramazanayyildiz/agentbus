@@ -44,12 +44,12 @@ struct TestDaemon {
 impl TestDaemon {
     fn start() -> Self {
         let tmp = tempfile::TempDir::new_in("/tmp").expect("create tempdir");
-        let home = tmp.path().to_path_buf();
-        let socket_path = home.join(".agentbus").join("agentbus.sock");
+        let bus_dir = tmp.path().join(".agentbus");
+        let socket_path = bus_dir.join("agentbus.sock");
         let exe = env!("CARGO_BIN_EXE_agentbusd");
 
         let child = Command::new(exe)
-            .env("HOME", &home)
+            .env("AGENTBUS_DIR", &bus_dir)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
