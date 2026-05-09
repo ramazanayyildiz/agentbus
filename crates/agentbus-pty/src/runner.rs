@@ -1,0 +1,372 @@
+//! Core PTY runner.
+//!
+//! Orchestrates four streams of bytes:
+//!
+//!   Local stdin ──┐
+//!                 ├─► PTY writer (serializer task) ──► PTY master
+//!   Bus message ──┘
+//!
+//!   PTY master ──► Local stdout
+//!
+//! The serializer is essential: without it, a long bus message could
+//! interleave with the user's keystrokes mid-write and corrupt the input
+//! line. With the mpsc, every write is atomic from the inner agent's
+//! perspective.
+
+use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agentbus_core::{socket_path, BusRequest, BusResponse};
+use anyhow::{anyhow, Context, Result};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, info, warn};
+
+use crate::inject;
+
+/// What the user is asking for. Kept small so the CLI layer stays thin.
+pub struct PtyRunnerConfig {
+    pub agent_name: String,
+    pub program: String,
+    pub model: String,
+    pub project: String,
+    pub argv: Vec<String>,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// Top-level entry point.
+pub struct PtyRunner;
+
+/// Bytes destined for the PTY master, with a tag so the serializer can log
+/// what it's writing. Using an enum (not just `Vec<u8>`) lets us add per-
+/// source policy later (e.g. rate limit bus injections).
+enum PtyWrite {
+    UserStdin(Vec<u8>),
+    BusMessage(Vec<u8>),
+}
+
+impl PtyRunner {
+    /// Run until the child exits or stdin closes. Restores terminal state on
+    /// every exit path including panics (best-effort — termios is restored
+    /// in the `_TermiosGuard` drop impl).
+    pub async fn run(cfg: PtyRunnerConfig) -> Result<i32> {
+        if cfg.argv.is_empty() {
+            return Err(anyhow!("argv is empty — nothing to run"));
+        }
+
+        // ---- 1. Connect to bus + register ------------------------------------
+        let sock = socket_path()?;
+        let bus = UnixStream::connect(&sock)
+            .await
+            .with_context(|| format!("connect to agentbus daemon at {:?}", sock))?;
+        let (bus_read, bus_write) = bus.into_split();
+        let bus_read = Arc::new(Mutex::new(BufReader::new(bus_read)));
+        let bus_write = Arc::new(Mutex::new(bus_write));
+
+        let register = BusRequest::Register {
+            name: cfg.agent_name.clone(),
+            program: cfg.program.clone(),
+            model: cfg.model.clone(),
+            project: cfg.project.clone(),
+        };
+        send_request(&bus_write, &register).await?;
+        let resp = recv_response(&bus_read).await?;
+        match &resp {
+            BusResponse::Ok { .. } => info!("registered '{}' on bus", cfg.agent_name),
+            BusResponse::Error { message } => {
+                return Err(anyhow!("bus registration failed: {}", message));
+            }
+            BusResponse::Message { .. } => {
+                return Err(anyhow!("unexpected message response during register"));
+            }
+        }
+
+        // ---- 2. Spawn PTY child ---------------------------------------------
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: cfg.rows,
+                cols: cfg.cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("openpty")?;
+
+        let mut cmd = CommandBuilder::new(&cfg.argv[0]);
+        for a in &cfg.argv[1..] {
+            cmd.arg(a);
+        }
+        cmd.cwd(std::env::current_dir()?);
+        // Inherit a useful environment. CommandBuilder defaults are minimal.
+        for (k, v) in std::env::vars() {
+            cmd.env(&k, &v);
+        }
+
+        let child = pair.slave.spawn_command(cmd).context("spawn child")?;
+        // Drop the slave handle now that the child has it; we only need master.
+        drop(pair.slave);
+
+        let pty_reader = pair.master.try_clone_reader().context("clone pty reader")?;
+        let pty_writer = pair.master.take_writer().context("take pty writer")?;
+
+        // ---- 3. Put local stdin into raw mode -------------------------------
+        let _termios_guard = TermiosGuard::install()?;
+
+        // ---- 4. Channels ----------------------------------------------------
+        let (write_tx, mut write_rx) = mpsc::channel::<PtyWrite>(256);
+
+        // ---- 5. Spawn worker tasks -----------------------------------------
+        // (a) PTY writer serializer — only ever one writer to the PTY master
+        let mut pty_writer_task = pty_writer;
+        let writer_join = tokio::task::spawn_blocking(move || -> Result<()> {
+            // We drive this with blocking_recv on a tokio mpsc.
+            // spawn_blocking gives us a real OS thread which is appropriate
+            // because the underlying PTY writer is a synchronous file handle.
+            while let Some(item) = write_rx.blocking_recv() {
+                let bytes = match &item {
+                    PtyWrite::UserStdin(b) => b.as_slice(),
+                    PtyWrite::BusMessage(b) => {
+                        debug!("injecting {} bytes from bus into PTY", b.len());
+                        b.as_slice()
+                    }
+                };
+                if let Err(e) = pty_writer_task.write_all(bytes) {
+                    warn!("pty write failed: {}", e);
+                    break;
+                }
+                if let Err(e) = pty_writer_task.flush() {
+                    warn!("pty flush failed: {}", e);
+                    break;
+                }
+            }
+            Ok(())
+        });
+
+        // (b) PTY reader -> local stdout passthrough
+        let pty_to_stdout = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut reader = pty_reader;
+            let mut buf = [0u8; 4096];
+            let mut stdout = std::io::stdout();
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stdout.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
+            Ok(())
+        });
+
+        // (c) Local stdin -> PTY writer channel
+        let stdin_tx = write_tx.clone();
+        let stdin_to_pty = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut stdin = std::io::stdin();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(PtyWrite::UserStdin(buf[..n].to_vec()))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            Ok(())
+        });
+
+        // (d) Bus reader -> PTY writer channel.
+        //
+        // Long-lived loop: send Read{wait:true, timeout=300s}, await response,
+        // forward Message responses to the PTY. On daemon disconnect we exit
+        // with an error.
+        let bus_tx = write_tx.clone();
+        let bus_read_clone = Arc::clone(&bus_read);
+        let bus_write_clone = Arc::clone(&bus_write);
+        let bus_to_pty = tokio::spawn(async move {
+            loop {
+                let req = BusRequest::Read {
+                    wait: Some(true),
+                    timeout_secs: Some(300),
+                };
+                if let Err(e) = send_request(&bus_write_clone, &req).await {
+                    warn!("bus send failed: {}", e);
+                    break;
+                }
+                match recv_response(&bus_read_clone).await {
+                    Ok(BusResponse::Message { message }) => {
+                        let bytes = inject::format_for_injection(&message);
+                        if bus_tx
+                            .send(PtyWrite::BusMessage(bytes))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(BusResponse::Ok { data }) => {
+                        // wait=true returns Ok([]) only on daemon timeout
+                        // expiry — keep polling.
+                        if data.is_array()
+                            && data.as_array().map(|a| a.is_empty()).unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        // Empty/unexpected Ok — keep going.
+                        debug!("unexpected Ok response in bus loop: {:?}", data);
+                    }
+                    Ok(BusResponse::Error { message }) => {
+                        // "No messages (timeout)" is normal under wait — loop.
+                        if message.contains("timeout") {
+                            continue;
+                        }
+                        warn!("bus error: {}", message);
+                        // Brief backoff to avoid tight error loops.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    Err(e) => {
+                        warn!("bus recv failed: {}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        // ---- 6. Wait for child exit -----------------------------------------
+        // portable-pty's Child is sync; poll it from a blocking task so we
+        // notice the exit without busy-looping the runtime.
+        let mut child_box = child;
+        let exit_code = tokio::task::spawn_blocking(move || -> Result<i32> {
+            loop {
+                match child_box.try_wait()? {
+                    Some(status) => {
+                        let code = status.exit_code() as i32;
+                        return Ok(code);
+                    }
+                    None => std::thread::sleep(Duration::from_millis(100)),
+                }
+            }
+        })
+        .await??;
+
+        info!("child exited with code {}", exit_code);
+
+        // ---- 7. Cleanup -----------------------------------------------------
+        // Closing the write_tx ends the writer task.
+        drop(write_tx);
+        // Best-effort: drop other tasks, restore termios via guard.
+        bus_to_pty.abort();
+        stdin_to_pty.abort();
+        pty_to_stdout.abort();
+        let _ = writer_join.await;
+
+        // Send Close to bus daemon. Best effort.
+        let close = BusRequest::Close;
+        let _ = send_request(&bus_write, &close).await;
+
+        Ok(exit_code)
+    }
+}
+
+// ----------------------------------------------------------------------
+// Helpers
+// ----------------------------------------------------------------------
+
+async fn send_request(
+    write: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    req: &BusRequest,
+) -> Result<()> {
+    let mut buf = serde_json::to_vec(req)?;
+    buf.push(b'\n');
+    let mut guard = write.lock().await;
+    guard.write_all(&buf).await?;
+    guard.flush().await?;
+    Ok(())
+}
+
+async fn recv_response(
+    read: &Arc<Mutex<BufReader<tokio::net::unix::OwnedReadHalf>>>,
+) -> Result<BusResponse> {
+    let mut line = String::new();
+    let mut guard = read.lock().await;
+    let n = guard.read_line(&mut line).await?;
+    if n == 0 {
+        return Err(anyhow!("daemon closed connection"));
+    }
+    let resp: BusResponse = serde_json::from_str(line.trim())
+        .with_context(|| format!("parse bus response: {:?}", line))?;
+    Ok(resp)
+}
+
+/// Restore termios on drop. Installed once at start of `run`.
+///
+/// If stdin is not a TTY (piped input, /dev/null, automated testing), we
+/// skip raw-mode setup entirely — there's no terminal to put into raw mode
+/// and no risk of canonical buffering since stdin will just deliver whatever
+/// bytes the upstream produces. The PTY layer still works; only the user
+/// keystroke -> PTY bridge degrades to "whatever stdin gives us, send it."
+struct TermiosGuard {
+    fd: i32,
+    saved: Option<libc::termios>,
+}
+
+impl TermiosGuard {
+    fn install() -> Result<Self> {
+        let fd = std::io::stdin().as_raw_fd();
+        let is_tty = unsafe { libc::isatty(fd) } == 1;
+        if !is_tty {
+            tracing::info!("stdin is not a TTY; skipping raw-mode setup");
+            return Ok(Self { fd, saved: None });
+        }
+
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+            return Err(anyhow!(
+                "tcgetattr failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let saved = t;
+        // Raw-ish mode: keep ISIG off so Ctrl-C goes to the inner agent,
+        // not us. Disable echo and canonical buffering. We turn off ICRNL
+        // so the inner agent sees a real \r when the user hits Enter.
+        t.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+        t.c_iflag &= !(libc::IXON | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::BRKINT);
+        t.c_cc[libc::VMIN] = 1;
+        t.c_cc[libc::VTIME] = 0;
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) } != 0 {
+            return Err(anyhow!(
+                "tcsetattr failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self {
+            fd,
+            saved: Some(saved),
+        })
+    }
+}
+
+impl Drop for TermiosGuard {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved {
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &saved);
+            }
+        }
+    }
+}

@@ -86,6 +86,41 @@ enum Commands {
 
     /// Show daemon status
     Status,
+
+    /// Wrap a command in a PTY, register it on the bus, and bridge bus
+    /// messages into the wrapped process. Use `--` to separate flags from
+    /// the target command, e.g.:
+    ///   agentbus run --name codex -- codex resume <id> --yolo
+    Run {
+        /// Agent name to register on the bus
+        #[arg(long)]
+        name: String,
+
+        /// Program type (used for adapter selection in Phase 2; informational
+        /// in Phase 1). Defaults to argv[0] of the wrapped command.
+        #[arg(long)]
+        program: Option<String>,
+
+        /// Model name (informational metadata)
+        #[arg(long, default_value = "unknown")]
+        model: String,
+
+        /// Project name (informational metadata)
+        #[arg(long, default_value = "default")]
+        project: String,
+
+        /// PTY rows
+        #[arg(long, default_value = "40")]
+        rows: u16,
+
+        /// PTY columns
+        #[arg(long, default_value = "120")]
+        cols: u16,
+
+        /// Command and args to execute inside the PTY. Everything after `--`.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -110,9 +145,66 @@ fn main() -> anyhow::Result<()> {
         Commands::Read { name, wait, timeout } => cmd_read(name.as_deref(), wait, timeout)?,
         Commands::Close { name } => cmd_close(&name)?,
         Commands::Status => cmd_status()?,
+        Commands::Run {
+            name,
+            program,
+            model,
+            project,
+            rows,
+            cols,
+            argv,
+        } => cmd_run(name, program, model, project, rows, cols, argv)?,
     }
 
     Ok(())
+}
+
+/// Run a target command wrapped in a PTY, bridged to the bus.
+///
+/// We need a tokio runtime here (the rest of the CLI is sync), so we build
+/// a multi-thread runtime locally rather than #[tokio::main]ing the whole
+/// binary. Keeps the other subcommands' startup latency unchanged.
+fn cmd_run(
+    name: String,
+    program: Option<String>,
+    model: String,
+    project: String,
+    rows: u16,
+    cols: u16,
+    argv: Vec<String>,
+) -> anyhow::Result<()> {
+    // Tracing for the runner. Quiet by default; logs go to stderr so they
+    // don't fight with the inner agent's output on stdout.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
+
+    if argv.is_empty() {
+        return Err(anyhow::anyhow!("`run` requires a command after --"));
+    }
+    let program = program.unwrap_or_else(|| {
+        std::path::Path::new(&argv[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
+
+    let cfg = agentbus_pty::runner::PtyRunnerConfig {
+        agent_name: name,
+        program,
+        model,
+        project,
+        argv,
+        rows,
+        cols,
+    };
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let code = rt.block_on(agentbus_pty::PtyRunner::run(cfg))?;
+    std::process::exit(code);
 }
 
 fn cmd_start() -> anyhow::Result<()> {
