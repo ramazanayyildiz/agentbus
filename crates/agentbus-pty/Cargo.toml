@@ -1,21 +1,17 @@
 [package]
-name = "agentbus-cli"
+name = "agentbus-pty"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 
-[[bin]]
-name = "agentbus"
-path = "src/main.rs"
+[lib]
 
 [dependencies]
 agentbus-core = { path = "../agentbus-core" }
-agentbus-pty = { path = "../agentbus-pty" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
-clap = { workspace = true }
+tracing = { workspace = true }
 anyhow = { workspace = true }
-dirs = "5"
-nix = { version = "0.28", features = ["signal"] }
-tracing-subscriber = { workspace = true }
+portable-pty = { workspace = true }
+libc = { workspace = true }

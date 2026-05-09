@@ -18,9 +18,12 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 dirs = "5"
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util", "macros"] }
 serde_json = "1"
 agentbus-core = { path = "../agentbus-core" }
+rusqlite = { workspace = true }
+serial_test = "3"

@@ -2,9 +2,9 @@
 //!
 //! Covers Test Plan cases F-001 .. F-014.
 //!
-//! Each test spawns a real `agentbusd` child process with `HOME` pointed at a
-//! unique tempdir under /tmp. This gives TRUE process isolation — concurrent
-//! tests cannot race on `dirs::home_dir()`.
+//! Each test spawns a real `agentbusd` child process with `AGENTBUS_DIR`
+//! pointed at a unique `<tempdir>/.agentbus`. This gives TRUE process
+//! isolation — concurrent tests cannot race on process-global state.
 //!
 //! ## TestDaemon harness
 //! - `TestDaemon::start()` spawns the daemon, waits for the unix socket to
@@ -34,15 +34,15 @@ impl TestDaemon {
     /// the unix socket to appear.
     fn start() -> Self {
         let tmp = tempfile::TempDir::new_in("/tmp").expect("create tempdir");
-        let home = tmp.path().to_path_buf();
-        let socket_path = home.join(".agentbus").join("agentbus.sock");
+        let bus_dir = tmp.path().join(".agentbus");
+        let socket_path = bus_dir.join("agentbus.sock");
 
         // `CARGO_BIN_EXE_agentbusd` is set by Cargo for integration tests in
         // the same crate as the binary.
         let exe = env!("CARGO_BIN_EXE_agentbusd");
 
         let child = Command::new(exe)
-            .env("HOME", &home)
+            .env("AGENTBUS_DIR", &bus_dir)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())

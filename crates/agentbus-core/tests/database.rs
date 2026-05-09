@@ -2,16 +2,16 @@
 //!
 //! Covers Test Plan cases M-001 .. M-012.
 //!
-//! ## HOME isolation
+//! ## Isolation
 //!
-//! `Database::init()` calls `dirs::home_dir()` which reads the process-global
-//! `HOME` env var. Cargo runs tests in parallel inside a single process, so we
-//! use `serial_test::serial` on every test that touches `HOME` to make the
-//! env manipulation safe. Each test creates its own `tempfile::TempDir` and
-//! points `HOME` at it for the duration of the test.
+//! `Database::init()` now honours the `AGENTBUS_DIR` env var, which points
+//! directly at the `.agentbus` directory to use. Tests still mutate a
+//! process-global env var, so we keep `serial_test::serial` on every test
+//! that touches it. Each test creates its own `tempfile::TempDir` and points
+//! `AGENTBUS_DIR` at `<tmp>/.agentbus` for the duration of the test.
 //!
 //! Each test also opens a separate raw `rusqlite::Connection` against the
-//! created `~/.agentbus/agentbus.db` for read-only assertions (checking
+//! created `<tmp>/.agentbus/bus.db` for read-only assertions (checking
 //! `read_at`, `claimed_at`, etc. directly).
 
 use agentbus_core::{AgentState, Database, MessageType};
@@ -26,8 +26,10 @@ fn fresh_db() -> (Database, TempDir) {
     // Force tempdir into /tmp so we're on a real local filesystem (iCloud-
     // backed directories can't host SQLite databases reliably).
     let tmp = tempfile::TempDir::new_in("/tmp").expect("create tempdir in /tmp");
-    std::env::set_var("HOME", tmp.path());
-    // Defensive cleanup in case a prior test leaked into this HOME.
+    // Point the core `agentbus_dir()` helper at this test's tempdir via
+    // `AGENTBUS_DIR`. Still process-global, hence `#[serial]` on tests.
+    std::env::set_var("AGENTBUS_DIR", tmp.path().join(".agentbus"));
+    // Defensive cleanup in case a prior test leaked into this dir.
     let _ = std::fs::remove_dir_all(tmp.path().join(".agentbus"));
     let db = Database::init().expect("Database::init");
     (db, tmp)
@@ -404,17 +406,64 @@ fn m009b_list_agents_empty_returns_empty_vec() {
 }
 
 // ---------------------------------------------------------------------------
-// M-010 — unregister_agent deletes row
+// M-010 — unregister_agent soft-deletes (state='unregistered'), preserves FKs
+//
+// Updated from the original "deletes row" semantics: HIGH-2 fix from the
+// external review. Hard DELETE broke FKs once the agent had any message
+// history. Soft-delete keeps the row, flips state to Unregistered, and the
+// next register_agent flips it back to Active via ON CONFLICT.
 // ---------------------------------------------------------------------------
 #[test]
 #[serial]
-fn m010_unregister_agent_deletes_row() {
+fn m010_unregister_agent_soft_deletes() {
     let (db, _tmp) = fresh_db();
     db.register_agent("alice", "p", "m", "proj").unwrap();
     assert!(db.agent_exists("alice").unwrap());
+
     db.unregister_agent("alice").unwrap();
-    assert!(!db.agent_exists("alice").unwrap());
-    assert!(db.get_agent("alice").unwrap().is_none());
+
+    // Row still present, but in 'unregistered' state.
+    assert!(db.agent_exists("alice").unwrap());
+    let agent = db.get_agent("alice").unwrap().expect("row preserved");
+    assert_eq!(agent.state, agentbus_core::AgentState::Unregistered);
+
+    // Re-register flips state back to Active without losing the row.
+    db.register_agent("alice", "p2", "m2", "proj2").unwrap();
+    let agent = db.get_agent("alice").unwrap().unwrap();
+    assert_eq!(agent.state, agentbus_core::AgentState::Active);
+    assert_eq!(agent.program, "p2");
+}
+
+// ---------------------------------------------------------------------------
+// M-010b — unregister doesn't break FKs even after sending messages
+//
+// HIGH-2 regression guard: if we ever go back to DELETE, this test fails
+// because messages.from_agent FK to agents(name) blocks the delete.
+// ---------------------------------------------------------------------------
+#[test]
+#[serial]
+fn m010b_unregister_works_with_message_history() {
+    let (mut db, _tmp) = fresh_db();
+    db.register_agent("alice", "p", "m", "proj").unwrap();
+    db.register_agent("bob", "p", "m", "proj").unwrap();
+
+    db.send_message(
+        "alice",
+        "bob",
+        None,
+        agentbus_core::MessageType::Request,
+        "hi",
+    )
+    .unwrap();
+
+    // Soft-delete must succeed even though messages reference 'alice'.
+    db.unregister_agent("alice").unwrap();
+    assert!(db.agent_exists("alice").unwrap());
+
+    // Bob can still claim the message — FK on from_agent still resolves.
+    let msgs = db.fetch_and_claim_messages("bob").unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].from, "alice");
 }
 
 // ---------------------------------------------------------------------------

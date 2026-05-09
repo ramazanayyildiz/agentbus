@@ -5,9 +5,10 @@
 //! Each test:
 //!   1. Locates `agentbusd` and `agentbus` binaries via the workspace target
 //!      directory (discovered relative to CARGO_MANIFEST_DIR).
-//!   2. Creates a per-test tempdir under /tmp and uses it as HOME.
-//!   3. Spawns the daemon as a child process.
-//!   4. Runs the `agentbus` CLI as a child process with the same HOME.
+//!   2. Creates a per-test tempdir under /tmp and uses `<tmp>/.agentbus` as
+//!      the `AGENTBUS_DIR`.
+//!   3. Spawns the daemon as a child process with `AGENTBUS_DIR` set.
+//!   4. Runs the `agentbus` CLI as a child process with the same env.
 //!   5. Asserts on stdout / exit codes.
 //!
 //! Harness: the e2e crate (`tests/`) lives inside the agentbus workspace, so
@@ -56,8 +57,8 @@ fn ensure_binaries_built() {
     assert!(cli_exe().exists(), "agentbus binary missing: {:?}", cli_exe());
 }
 
-/// Spawn the daemon with a fresh tempdir HOME. Returns the handle and the
-/// tempdir (hold both until test ends).
+/// Spawn the daemon with a fresh tempdir pointed at by `AGENTBUS_DIR`.
+/// Returns the handle and the tempdir (hold both until test ends).
 struct DaemonHandle {
     child: Child,
     tmp: TempDir,
@@ -67,16 +68,16 @@ impl DaemonHandle {
     fn start() -> Self {
         ensure_binaries_built();
         let tmp = tempfile::TempDir::new_in("/tmp").expect("tempdir");
-        let home = tmp.path().to_path_buf();
+        let bus_dir = tmp.path().join(".agentbus");
         let child = Command::new(daemon_exe())
-            .env("HOME", &home)
+            .env("AGENTBUS_DIR", &bus_dir)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn daemon");
         // Wait for socket file
-        let socket_path = home.join(".agentbus").join("agentbus.sock");
+        let socket_path = bus_dir.join("agentbus.sock");
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if socket_path.exists() {
@@ -90,8 +91,8 @@ impl DaemonHandle {
         panic!("daemon socket never appeared at {:?}", socket_path);
     }
 
-    fn home(&self) -> &Path {
-        self.tmp.path()
+    fn bus_dir(&self) -> PathBuf {
+        self.tmp.path().join(".agentbus")
     }
 }
 
@@ -102,9 +103,9 @@ impl Drop for DaemonHandle {
     }
 }
 
-fn cli(home: &Path, args: &[&str]) -> std::process::Output {
+fn cli(bus_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(cli_exe())
-        .env("HOME", home)
+        .env("AGENTBUS_DIR", bus_dir)
         .args(args)
         .output()
         .expect("run agentbus cli")
@@ -119,7 +120,7 @@ fn uf001_full_demo_flow_alice_bob_roundtrip() {
 
     // register alice
     let out = cli(
-        daemon.home(),
+        &daemon.bus_dir(),
         &["register", "--name", "alice", "--program", "test"],
     );
     assert!(
@@ -131,14 +132,14 @@ fn uf001_full_demo_flow_alice_bob_roundtrip() {
 
     // register bob
     let out = cli(
-        daemon.home(),
+        &daemon.bus_dir(),
         &["register", "--name", "bob", "--program", "test"],
     );
     assert!(out.status.success(), "register bob failed");
 
     // alice sends "hello"
     let out = cli(
-        daemon.home(),
+        &daemon.bus_dir(),
         &[
             "send",
             "--from",
@@ -158,7 +159,7 @@ fn uf001_full_demo_flow_alice_bob_roundtrip() {
     );
 
     // bob reads (non-wait)
-    let out = cli(daemon.home(), &["read", "--name", "bob"]);
+    let out = cli(&daemon.bus_dir(), &["read", "--name", "bob"]);
     assert!(
         out.status.success(),
         "read failed: stdout={} stderr={}",
@@ -185,12 +186,12 @@ fn uf002_blocking_read_bob_waits_alice_sends() {
 
     // Pre-register both agents
     let out = cli(
-        daemon.home(),
+        &daemon.bus_dir(),
         &["register", "--name", "alice", "--program", "test"],
     );
     assert!(out.status.success());
     let out = cli(
-        daemon.home(),
+        &daemon.bus_dir(),
         &["register", "--name", "bob", "--program", "test"],
     );
     assert!(out.status.success());
@@ -199,7 +200,7 @@ fn uf002_blocking_read_bob_waits_alice_sends() {
 
     // Spawn bob in the background with --wait --timeout 10
     let bob = Command::new(cli_exe())
-        .env("HOME", daemon.home())
+        .env("AGENTBUS_DIR", daemon.bus_dir())
         .args(["read", "--name", "bob", "--wait", "--timeout", "10"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -211,7 +212,7 @@ fn uf002_blocking_read_bob_waits_alice_sends() {
 
     // alice sends
     let out = cli(
-        daemon.home(),
+        &daemon.bus_dir(),
         &[
             "send",
             "--from",

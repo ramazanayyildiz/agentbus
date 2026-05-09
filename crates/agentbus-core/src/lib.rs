@@ -34,6 +34,11 @@ pub enum AgentState {
     Done,
     #[serde(rename = "error")]
     Error,
+    /// Agent has been unregistered (soft-deleted). Row stays in the table
+    /// so message FKs remain valid; the daemon won't push messages to
+    /// agents in this state and re-registering flips state back to Active.
+    #[serde(rename = "unregistered")]
+    Unregistered,
 }
 
 impl AgentState {
@@ -44,6 +49,7 @@ impl AgentState {
             AgentState::Waiting => "waiting",
             AgentState::Done => "done",
             AgentState::Error => "error",
+            AgentState::Unregistered => "unregistered",
         }
     }
 
@@ -58,6 +64,7 @@ impl AgentState {
             "waiting" => Ok(AgentState::Waiting),
             "done" => Ok(AgentState::Done),
             "error" => Ok(AgentState::Error),
+            "unregistered" => Ok(AgentState::Unregistered),
             other => Err(BusError::InvalidAgentState(other.to_string())),
         }
     }
@@ -164,7 +171,7 @@ pub enum BusRequest {
 }
 
 /// Daemon → Client protocol
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum BusResponse {
     Ok {
@@ -184,11 +191,12 @@ pub struct Database {
 }
 
 impl Database {
-    /// Initialize database, create ~/.agentbus directory and db file
+    /// Initialize database, create ~/.agentbus directory and db file.
+    ///
+    /// Honours the `AGENTBUS_DIR` env var if set (used by tests for full
+    /// per-process isolation); otherwise falls back to `~/.agentbus`.
     pub fn init() -> anyhow::Result<Self> {
-        let db_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
-            .join(".agentbus");
+        let db_dir = agentbus_dir()?;
 
         fs::create_dir_all(&db_dir)?;
 
@@ -317,9 +325,17 @@ impl Database {
         }
     }
 
+    /// Soft-delete an agent: flip its state to `unregistered` instead of
+    /// DELETEing the row. Preserves message FKs (Issue: HIGH-2 from external
+    /// review — `messages.from_agent`/`to_agent` FK to `agents(name)` had no
+    /// `ON DELETE` behavior, so DELETE failed once the agent had any history).
+    /// Re-registering with the same name flips state back to Active via the
+    /// existing `register_agent` ON CONFLICT path.
     pub fn unregister_agent(&self, name: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM agents WHERE name = ?", rusqlite::params![name])?;
+        self.conn.execute(
+            "UPDATE agents SET state = ?1 WHERE name = ?2",
+            rusqlite::params![AgentState::Unregistered.as_str(), name],
+        )?;
         Ok(())
     }
 
@@ -560,11 +576,42 @@ impl Database {
     }
 }
 
-/// Helper to get agentbus directory path
+/// Helper to get agentbus directory path.
+///
+/// Respects `AGENTBUS_DIR` if set so integration and unit tests can point each
+/// spawned daemon or in-process `Database` at an isolated tempdir without
+/// mutating process-global `HOME`. Falls back to `~/.agentbus`.
 pub fn agentbus_dir() -> anyhow::Result<PathBuf> {
+    if let Ok(override_dir) = std::env::var("AGENTBUS_DIR") {
+        if !override_dir.is_empty() {
+            return Ok(PathBuf::from(override_dir));
+        }
+    }
     let dir = dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(".agentbus");
+    Ok(dir)
+}
+
+/// Create the agentbus directory if missing and ensure it has 0700
+/// permissions on Unix. Centralizes the policy from MED-3 of the external
+/// review: the bus carries messages that can be injected into other agents'
+/// terminals, so any other user on the machine being able to read the DB
+/// or connect to the socket is a real risk.
+///
+/// Idempotent — safe to call from both the daemon and the CLI.
+pub fn ensure_agentbus_dir() -> anyhow::Result<PathBuf> {
+    let dir = agentbus_dir()?;
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dir)?.permissions();
+        if perms.mode() & 0o777 != 0o700 {
+            perms.set_mode(0o700);
+            fs::set_permissions(&dir, perms)?;
+        }
+    }
     Ok(dir)
 }
 
