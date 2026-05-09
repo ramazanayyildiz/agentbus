@@ -15,8 +15,9 @@
 
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agentbus_core::{socket_path, BusRequest, BusResponse};
 use anyhow::{anyhow, Context, Result};
@@ -130,6 +131,13 @@ impl PtyRunner {
         // ---- 4. Channels ----------------------------------------------------
         let (write_tx, mut write_rx) = mpsc::channel::<PtyWrite>(256);
 
+        // Shared "last PTY output time" — updated by Task C every time bytes
+        // arrive from the wrapped agent, read by Task B before injecting a
+        // bus message. We store millis-since-process-start in an AtomicI64
+        // so the readers don't need a Mutex on the hot path.
+        let process_start = Instant::now();
+        let last_output_ms = Arc::new(AtomicI64::new(0));
+
         // ---- 5. Spawn worker tasks -----------------------------------------
         // (a) PTY writer serializer — only ever one writer to the PTY master
         let mut pty_writer_task = pty_writer;
@@ -157,7 +165,11 @@ impl PtyRunner {
             Ok(())
         });
 
-        // (b) PTY reader -> local stdout passthrough
+        // (b) PTY reader -> local stdout passthrough.
+        //
+        // Side effect: stamps `last_output_ms` on every read so the bus
+        // injection task can detect idle periods.
+        let last_output_for_reader = Arc::clone(&last_output_ms);
         let pty_to_stdout = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut reader = pty_reader;
             let mut buf = [0u8; 4096];
@@ -166,6 +178,8 @@ impl PtyRunner {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        let now_ms = process_start.elapsed().as_millis() as i64;
+                        last_output_for_reader.store(now_ms, Ordering::Relaxed);
                         if stdout.write_all(&buf[..n]).is_err() {
                             break;
                         }
@@ -208,6 +222,8 @@ impl PtyRunner {
         let bus_read_clone = Arc::clone(&bus_read);
         let bus_write_clone = Arc::clone(&bus_write);
         let adapter_for_bus = Arc::clone(&adapter_arc);
+        let last_output_for_bus = Arc::clone(&last_output_ms);
+        let idle_threshold = adapter_arc.idle_ms_before_inject();
         let bus_to_pty = tokio::spawn(async move {
             loop {
                 let req = BusRequest::Read {
@@ -220,6 +236,35 @@ impl PtyRunner {
                 }
                 match recv_response(&bus_read_clone).await {
                     Ok(BusResponse::Message { message }) => {
+                        // Phase 3: idle gating. If the adapter wants idle
+                        // detection, poll last_output_ms until the gap from
+                        // the most recent PTY output exceeds the threshold.
+                        // We cap the wait at 30s so a stuck agent can't
+                        // permanently block bus messages — if no idle window
+                        // appears, the message goes through anyway and the
+                        // user sees it interleave with running output.
+                        if idle_threshold > 0 {
+                            let max_wait = Duration::from_secs(30);
+                            let started = Instant::now();
+                            loop {
+                                let now_ms = process_start.elapsed().as_millis() as i64;
+                                let last_ms =
+                                    last_output_for_bus.load(Ordering::Relaxed);
+                                let idle_for = now_ms.saturating_sub(last_ms) as u64;
+                                if idle_for >= idle_threshold {
+                                    break;
+                                }
+                                if started.elapsed() >= max_wait {
+                                    debug!(
+                                        "idle wait exceeded {:?}; injecting anyway",
+                                        max_wait
+                                    );
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+
                         let bytes = adapter_for_bus.format_message(&message);
                         if bus_tx
                             .send(PtyWrite::BusMessage(bytes))

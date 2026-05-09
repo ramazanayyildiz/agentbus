@@ -30,6 +30,17 @@ pub trait Adapter: Send + Sync {
     /// should always sanitize body content via `inject::sanitize` before
     /// embedding it.
     fn format_message(&self, msg: &Message) -> Vec<u8>;
+
+    /// Minimum idle time (ms) the PTY output stream must show before this
+    /// adapter is willing to inject a message. Phase 3 uses this as a
+    /// universal "the agent isn't actively producing output right now"
+    /// heuristic, in lieu of fragile prompt-regex detection.
+    ///
+    /// Returning 0 disables idle gating — the message is injected as soon
+    /// as it arrives. Phase 1/2 behavior.
+    fn idle_ms_before_inject(&self) -> u64 {
+        0
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -68,6 +79,13 @@ impl Adapter for ClaudeAdapter {
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         bracketed_paste_envelope(msg)
     }
+
+    /// Claude Code streams output during a response. 750ms idle is enough
+    /// to confirm the streaming has settled at the prompt without making
+    /// the bus feel laggy.
+    fn idle_ms_before_inject(&self) -> u64 {
+        750
+    }
 }
 
 /// Codex adapter. Behavior identical to Claude's for now (same input model:
@@ -83,6 +101,10 @@ impl Adapter for CodexAdapter {
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         bracketed_paste_envelope(msg)
     }
+
+    fn idle_ms_before_inject(&self) -> u64 {
+        750
+    }
 }
 
 /// Aider adapter. Aider has a readline-style prompt so plain envelope + CR
@@ -97,6 +119,10 @@ impl Adapter for AiderAdapter {
 
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         inject::format_for_injection(msg)
+    }
+
+    fn idle_ms_before_inject(&self) -> u64 {
+        500
     }
 }
 
@@ -207,5 +233,16 @@ mod tests {
     fn case_insensitive_matching() {
         assert_eq!(pick("CLAUDE").name(), "claude");
         assert_eq!(pick("Codex").name(), "codex");
+    }
+
+    #[test]
+    fn idle_thresholds_match_per_adapter_expectations() {
+        // Streaming TUIs need a beat to settle.
+        assert_eq!(ClaudeAdapter.idle_ms_before_inject(), 750);
+        assert_eq!(CodexAdapter.idle_ms_before_inject(), 750);
+        // Aider's prompt is calmer.
+        assert_eq!(AiderAdapter.idle_ms_before_inject(), 500);
+        // Generic fallback: no gating, behave like Phase 1/2.
+        assert_eq!(GenericAdapter.idle_ms_before_inject(), 0);
     }
 }
