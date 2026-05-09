@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "pty-smoke"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "pty-smoke"
+path = "main.rs"
+
+[dependencies]
+portable-pty = "0.8"
+anyhow = "1"
+libc = "0.2"
+
+[[bin]]
+name = "mock-agent"
+path = "mock_agent.rs"
