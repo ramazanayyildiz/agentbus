@@ -593,6 +593,28 @@ pub fn agentbus_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Create the agentbus directory if missing and ensure it has 0700
+/// permissions on Unix. Centralizes the policy from MED-3 of the external
+/// review: the bus carries messages that can be injected into other agents'
+/// terminals, so any other user on the machine being able to read the DB
+/// or connect to the socket is a real risk.
+///
+/// Idempotent — safe to call from both the daemon and the CLI.
+pub fn ensure_agentbus_dir() -> anyhow::Result<PathBuf> {
+    let dir = agentbus_dir()?;
+    fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&dir)?.permissions();
+        if perms.mode() & 0o777 != 0o700 {
+            perms.set_mode(0o700);
+            fs::set_permissions(&dir, perms)?;
+        }
+    }
+    Ok(dir)
+}
+
 /// Get socket path
 pub fn socket_path() -> anyhow::Result<PathBuf> {
     Ok(agentbus_dir()?.join("agentbus.sock"))

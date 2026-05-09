@@ -1,4 +1,6 @@
-use agentbus_core::{agentbus_dir, pid_file_path, socket_path, BusRequest, BusResponse, Database};
+use agentbus_core::{
+    ensure_agentbus_dir, pid_file_path, socket_path, BusRequest, BusResponse, Database,
+};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs;
@@ -20,21 +22,47 @@ type DbHandle = Arc<Mutex<Database>>;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    // Initialize database
+    // MED-3 fix (external review): ensure ~/.agentbus exists with 0700 perms
+    // before doing anything else. The daemon writes the DB and binds the
+    // socket inside this dir, so locking down access at the dir level is
+    // the simplest defense against other users on the machine.
+    ensure_agentbus_dir()?;
+
+    // MED-1 fix: don't blindly clobber a running daemon's socket. If a
+    // PID file exists and that PID is alive, refuse to start. We only
+    // remove the socket after we've established no other daemon owns it.
+    let pid_path = pid_file_path()?;
+    if pid_path.exists() {
+        if let Ok(prev) = fs::read_to_string(&pid_path) {
+            if let Ok(prev_pid) = prev.trim().parse::<u32>() {
+                if pid_alive(prev_pid) {
+                    eprintln!(
+                        "agentbusd: another daemon is already running (PID {}). Refusing to start.",
+                        prev_pid
+                    );
+                    std::process::exit(1);
+                } else {
+                    info!(
+                        "stale PID file found for PID {} (process not alive); reclaiming",
+                        prev_pid
+                    );
+                }
+            }
+        }
+    }
+
+    // Initialize database (after dir + lock so we don't create files in a
+    // contested location).
     let db = Arc::new(Mutex::new(Database::init()?));
     info!("Database initialized");
 
-    // Create .agentbus directory if needed
-    let bus_dir = agentbus_dir()?;
-    fs::create_dir_all(&bus_dir)?;
-
-    // Write PID file
+    // Write our PID file (claims the bus_dir).
     let pid = std::process::id();
-    let pid_path = pid_file_path()?;
     fs::write(&pid_path, pid.to_string())?;
     info!("Daemon PID {} written to {:?}", pid, pid_path);
 
-    // Remove old socket if it exists
+    // Remove old socket if it exists. Safe now because we've verified no
+    // other live daemon owns this dir.
     let sock_path = socket_path()?;
     if sock_path.exists() {
         fs::remove_file(&sock_path)?;
@@ -42,6 +70,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Listen on Unix socket
     let listener = UnixListener::bind(&sock_path)?;
+    // Lock down the socket itself to 0600 (owner-only) to match the dir.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&sock_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&sock_path, perms)?;
+    }
     info!("Listening on {:?}", sock_path);
 
     // Map of connected agents: agent_name → message channel
@@ -895,4 +931,30 @@ mod tests {
         }
         assert!(writer.take_writes().is_empty());
     }
+}
+
+/// Best-effort liveness check for a PID. Used by daemon startup to decide
+/// whether a stale PID file represents a real process or just a leftover
+/// from a previous unclean shutdown. On Unix we send signal 0 — kill(2)
+/// returns 0 if the process exists and we're allowed to signal it,
+/// ESRCH if it doesn't exist.
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if res == 0 {
+        return true;
+    }
+    // EPERM means the process exists but we're not allowed to signal it.
+    // Still counts as "alive" — refuse to start, don't clobber its socket.
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(0);
+    errno == libc::EPERM
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    // Conservative: if we can't probe, assume it's alive — better to
+    // refuse to start than to clobber another daemon's socket.
+    true
 }
