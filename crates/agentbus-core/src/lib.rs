@@ -34,6 +34,11 @@ pub enum AgentState {
     Done,
     #[serde(rename = "error")]
     Error,
+    /// Agent has been unregistered (soft-deleted). Row stays in the table
+    /// so message FKs remain valid; the daemon won't push messages to
+    /// agents in this state and re-registering flips state back to Active.
+    #[serde(rename = "unregistered")]
+    Unregistered,
 }
 
 impl AgentState {
@@ -44,6 +49,7 @@ impl AgentState {
             AgentState::Waiting => "waiting",
             AgentState::Done => "done",
             AgentState::Error => "error",
+            AgentState::Unregistered => "unregistered",
         }
     }
 
@@ -58,6 +64,7 @@ impl AgentState {
             "waiting" => Ok(AgentState::Waiting),
             "done" => Ok(AgentState::Done),
             "error" => Ok(AgentState::Error),
+            "unregistered" => Ok(AgentState::Unregistered),
             other => Err(BusError::InvalidAgentState(other.to_string())),
         }
     }
@@ -318,9 +325,17 @@ impl Database {
         }
     }
 
+    /// Soft-delete an agent: flip its state to `unregistered` instead of
+    /// DELETEing the row. Preserves message FKs (Issue: HIGH-2 from external
+    /// review — `messages.from_agent`/`to_agent` FK to `agents(name)` had no
+    /// `ON DELETE` behavior, so DELETE failed once the agent had any history).
+    /// Re-registering with the same name flips state back to Active via the
+    /// existing `register_agent` ON CONFLICT path.
     pub fn unregister_agent(&self, name: &str) -> anyhow::Result<()> {
-        self.conn
-            .execute("DELETE FROM agents WHERE name = ?", rusqlite::params![name])?;
+        self.conn.execute(
+            "UPDATE agents SET state = ?1 WHERE name = ?2",
+            rusqlite::params![AgentState::Unregistered.as_str(), name],
+        )?;
         Ok(())
     }
 

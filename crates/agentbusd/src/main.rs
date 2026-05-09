@@ -372,6 +372,34 @@ async fn dispatch_request<W: MessageWriter>(
         }
 
         BusRequest::Unregister { name } => {
+            // HIGH-1 fix (external review): only the connection that owns the
+            // agent's name (i.e. the one that successfully Registered it) can
+            // Unregister it. Without this check any client can boot any other
+            // agent off the bus by sending an Unregister request.
+            //
+            // Two failure modes are rejected here:
+            //   - this connection isn't registered at all (agent_name == None)
+            //   - this connection registered as someone else (mismatch)
+            match agent_name.as_deref() {
+                None => {
+                    return Ok(Some(BusResponse::Error {
+                        message: format!(
+                            "not authorized to unregister '{}': this connection is not registered",
+                            name
+                        ),
+                    }));
+                }
+                Some(owner) if owner != name => {
+                    return Ok(Some(BusResponse::Error {
+                        message: format!(
+                            "not authorized to unregister '{}': this connection registered as '{}'",
+                            name, owner
+                        ),
+                    }));
+                }
+                _ => {}
+            }
+
             let name_c = name.clone();
             match db_call(db, move |d| d.unregister_agent(&name_c)).await {
                 Ok(()) => {

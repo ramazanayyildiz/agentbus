@@ -406,17 +406,64 @@ fn m009b_list_agents_empty_returns_empty_vec() {
 }
 
 // ---------------------------------------------------------------------------
-// M-010 — unregister_agent deletes row
+// M-010 — unregister_agent soft-deletes (state='unregistered'), preserves FKs
+//
+// Updated from the original "deletes row" semantics: HIGH-2 fix from the
+// external review. Hard DELETE broke FKs once the agent had any message
+// history. Soft-delete keeps the row, flips state to Unregistered, and the
+// next register_agent flips it back to Active via ON CONFLICT.
 // ---------------------------------------------------------------------------
 #[test]
 #[serial]
-fn m010_unregister_agent_deletes_row() {
+fn m010_unregister_agent_soft_deletes() {
     let (db, _tmp) = fresh_db();
     db.register_agent("alice", "p", "m", "proj").unwrap();
     assert!(db.agent_exists("alice").unwrap());
+
     db.unregister_agent("alice").unwrap();
-    assert!(!db.agent_exists("alice").unwrap());
-    assert!(db.get_agent("alice").unwrap().is_none());
+
+    // Row still present, but in 'unregistered' state.
+    assert!(db.agent_exists("alice").unwrap());
+    let agent = db.get_agent("alice").unwrap().expect("row preserved");
+    assert_eq!(agent.state, agentbus_core::AgentState::Unregistered);
+
+    // Re-register flips state back to Active without losing the row.
+    db.register_agent("alice", "p2", "m2", "proj2").unwrap();
+    let agent = db.get_agent("alice").unwrap().unwrap();
+    assert_eq!(agent.state, agentbus_core::AgentState::Active);
+    assert_eq!(agent.program, "p2");
+}
+
+// ---------------------------------------------------------------------------
+// M-010b — unregister doesn't break FKs even after sending messages
+//
+// HIGH-2 regression guard: if we ever go back to DELETE, this test fails
+// because messages.from_agent FK to agents(name) blocks the delete.
+// ---------------------------------------------------------------------------
+#[test]
+#[serial]
+fn m010b_unregister_works_with_message_history() {
+    let (mut db, _tmp) = fresh_db();
+    db.register_agent("alice", "p", "m", "proj").unwrap();
+    db.register_agent("bob", "p", "m", "proj").unwrap();
+
+    db.send_message(
+        "alice",
+        "bob",
+        None,
+        agentbus_core::MessageType::Request,
+        "hi",
+    )
+    .unwrap();
+
+    // Soft-delete must succeed even though messages reference 'alice'.
+    db.unregister_agent("alice").unwrap();
+    assert!(db.agent_exists("alice").unwrap());
+
+    // Bob can still claim the message — FK on from_agent still resolves.
+    let msgs = db.fetch_and_claim_messages("bob").unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].from, "alice");
 }
 
 // ---------------------------------------------------------------------------
