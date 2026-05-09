@@ -38,6 +38,10 @@ pub struct PtyRunnerConfig {
     pub argv: Vec<String>,
     pub rows: u16,
     pub cols: u16,
+    /// If set, every byte read from the PTY master is appended to this
+    /// path verbatim. Useful for replay, debugging, and (eventually) the
+    /// Phase 4 transcript_chunks table once we centralize storage.
+    pub transcript_path: Option<std::path::PathBuf>,
 }
 
 /// Top-level entry point.
@@ -167,13 +171,32 @@ impl PtyRunner {
 
         // (b) PTY reader -> local stdout passthrough.
         //
-        // Side effect: stamps `last_output_ms` on every read so the bus
-        // injection task can detect idle periods.
+        // Side effects:
+        //   - stamps `last_output_ms` on every read so the bus injection task
+        //     can detect idle periods (Phase 3)
+        //   - if a transcript path was configured, append every byte to it
+        //     for replay / debugging (Phase 4 lite — file-backed, no DB)
         let last_output_for_reader = Arc::clone(&last_output_ms);
+        let transcript_path = cfg.transcript_path.clone();
         let pty_to_stdout = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut reader = pty_reader;
             let mut buf = [0u8; 4096];
             let mut stdout = std::io::stdout();
+            // Open the transcript file once; tolerate failure by leaving it
+            // None and just not writing.
+            let mut transcript = transcript_path.as_ref().and_then(|p| {
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                {
+                    Ok(f) => Some(f),
+                    Err(e) => {
+                        warn!("transcript file open failed for {:?}: {}", p, e);
+                        None
+                    }
+                }
+            });
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
@@ -184,6 +207,11 @@ impl PtyRunner {
                             break;
                         }
                         let _ = stdout.flush();
+                        if let Some(f) = transcript.as_mut() {
+                            let _ = f.write_all(&buf[..n]);
+                            // No flush — the OS will batch writes; on exit
+                            // the file is closed so anything in-flight lands.
+                        }
                     }
                     Err(_) => break,
                 }

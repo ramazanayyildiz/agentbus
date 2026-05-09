@@ -117,6 +117,21 @@ enum Commands {
         #[arg(long, default_value = "120")]
         cols: u16,
 
+        /// If set, every byte produced by the wrapped agent is also appended
+        /// to this file. Useful for replay or post-hoc inspection.
+        #[arg(long)]
+        transcript: Option<std::path::PathBuf>,
+
+        /// Restart the wrapped command if it exits non-zero. The bus
+        /// registration is preserved across restarts; messages queued
+        /// during the gap are picked up on the next read.
+        #[arg(long)]
+        restart: bool,
+
+        /// Maximum number of restarts before giving up. Default: 5.
+        #[arg(long, default_value = "5")]
+        max_restarts: u32,
+
         /// Command and args to execute inside the PTY. Everything after `--`.
         #[arg(last = true, required = true)]
         argv: Vec<String>,
@@ -152,8 +167,22 @@ fn main() -> anyhow::Result<()> {
             project,
             rows,
             cols,
+            transcript,
+            restart,
+            max_restarts,
             argv,
-        } => cmd_run(name, program, model, project, rows, cols, argv)?,
+        } => cmd_run(
+            name,
+            program,
+            model,
+            project,
+            rows,
+            cols,
+            transcript,
+            restart,
+            max_restarts,
+            argv,
+        )?,
     }
 
     Ok(())
@@ -171,6 +200,9 @@ fn cmd_run(
     project: String,
     rows: u16,
     cols: u16,
+    transcript: Option<std::path::PathBuf>,
+    restart: bool,
+    max_restarts: u32,
     argv: Vec<String>,
 ) -> anyhow::Result<()> {
     // Tracing for the runner. Quiet by default; logs go to stderr so they
@@ -190,21 +222,50 @@ fn cmd_run(
             .to_string()
     });
 
-    let cfg = agentbus_pty::runner::PtyRunnerConfig {
-        agent_name: name,
-        program,
-        model,
-        project,
-        argv,
-        rows,
-        cols,
-    };
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let code = rt.block_on(agentbus_pty::PtyRunner::run(cfg))?;
-    std::process::exit(code);
+
+    // Restart loop. With --restart we keep the bus registration alive across
+    // child restarts: each iteration builds a fresh PtyRunnerConfig (cheap),
+    // calls into the runner, and decides whether to retry based on exit
+    // code + restart budget. Successful exits (code 0) always return — we
+    // only retry on failure.
+    let mut attempts: u32 = 0;
+    loop {
+        let cfg = agentbus_pty::runner::PtyRunnerConfig {
+            agent_name: name.clone(),
+            program: program.clone(),
+            model: model.clone(),
+            project: project.clone(),
+            argv: argv.clone(),
+            rows,
+            cols,
+            transcript_path: transcript.clone(),
+        };
+        let code = rt.block_on(agentbus_pty::PtyRunner::run(cfg))?;
+
+        if code == 0 || !restart {
+            std::process::exit(code);
+        }
+
+        attempts += 1;
+        if attempts > max_restarts {
+            eprintln!(
+                "agentbus run: exceeded max-restarts ({}), giving up. Last exit code: {}",
+                max_restarts, code
+            );
+            std::process::exit(code);
+        }
+
+        // Backoff: doubles each retry, capped at 30 seconds.
+        let backoff = std::cmp::min(30, 1u64 << attempts.min(5));
+        eprintln!(
+            "agentbus run: child exited with code {}; restarting in {}s (attempt {}/{})",
+            code, backoff, attempts, max_restarts
+        );
+        std::thread::sleep(std::time::Duration::from_secs(backoff));
+    }
 }
 
 fn cmd_start() -> anyhow::Result<()> {
