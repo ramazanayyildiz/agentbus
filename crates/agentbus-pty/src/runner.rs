@@ -102,15 +102,21 @@ impl PtyRunner {
         }
 
         // ---- 2. Spawn PTY child ---------------------------------------------
+        // Prefer the local terminal's actual size if stdout is a TTY — that
+        // way the wrapped agent's TUI renders at the right dimensions
+        // instead of our 40x120 default. Falls back to cfg values when we
+        // can't query (e.g. piped or background runs).
+        let (rows, cols) = detect_local_size().unwrap_or((cfg.rows, cfg.cols));
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
-                rows: cfg.rows,
-                cols: cfg.cols,
+                rows,
+                cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
             .context("openpty")?;
+        info!("PTY initial size: {}x{} (rows x cols)", rows, cols);
 
         let mut cmd = CommandBuilder::new(&cfg.argv[0]);
         for a in &cfg.argv[1..] {
@@ -128,6 +134,10 @@ impl PtyRunner {
 
         let pty_reader = pair.master.try_clone_reader().context("clone pty reader")?;
         let pty_writer = pair.master.take_writer().context("take pty writer")?;
+        // Keep the master so we can call resize() on SIGWINCH. Wrapped in a
+        // mutex because the resize task and any future master-using code
+        // share it.
+        let pty_master = Arc::new(Mutex::new(pair.master));
 
         // ---- 3. Put local stdin into raw mode -------------------------------
         let _termios_guard = TermiosGuard::install()?;
@@ -330,6 +340,39 @@ impl PtyRunner {
             }
         });
 
+        // (e) SIGWINCH propagation — when the user resizes their local
+        // terminal we need to resize the PTY too, otherwise the inner
+        // agent's TUI keeps rendering at the original size.
+        let pty_master_for_winch = Arc::clone(&pty_master);
+        let winch_task = tokio::spawn(async move {
+            #[cfg(unix)]
+            {
+                use tokio::signal::unix::{signal, SignalKind};
+                let mut winch = match signal(SignalKind::window_change()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!("SIGWINCH handler install failed: {}", e);
+                        return;
+                    }
+                };
+                while winch.recv().await.is_some() {
+                    if let Some((rows, cols)) = detect_local_size() {
+                        let m = pty_master_for_winch.lock().await;
+                        if let Err(e) = m.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        }) {
+                            warn!("PTY resize failed: {}", e);
+                        } else {
+                            debug!("resized PTY to {}x{}", rows, cols);
+                        }
+                    }
+                }
+            }
+        });
+
         // ---- 6. Wait for child exit -----------------------------------------
         // portable-pty's Child is sync; poll it from a blocking task so we
         // notice the exit without busy-looping the runtime.
@@ -356,6 +399,7 @@ impl PtyRunner {
         bus_to_pty.abort();
         stdin_to_pty.abort();
         pty_to_stdout.abort();
+        winch_task.abort();
         let _ = writer_join.await;
 
         // Send Close to bus daemon. Best effort.
@@ -453,4 +497,27 @@ impl Drop for TermiosGuard {
             }
         }
     }
+}
+
+/// Query the local controlling terminal for its current (rows, cols).
+/// Returns None if stdout isn't a TTY or the ioctl fails — caller falls
+/// back to a configured default.
+fn detect_local_size() -> Option<(u16, u16)> {
+    // We probe stdout because in `agentbus run` stdin gets put into raw
+    // mode and may be redirected; stdout is the natural reference for
+    // "what terminal is the user looking at."
+    let fd = std::io::stdout().as_raw_fd();
+    if unsafe { libc::isatty(fd) } != 1 {
+        return None;
+    }
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ is defined for ttys; we just verified isatty.
+    let res = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if res != 0 {
+        return None;
+    }
+    if ws.ws_row == 0 || ws.ws_col == 0 {
+        return None;
+    }
+    Some((ws.ws_row, ws.ws_col))
 }
