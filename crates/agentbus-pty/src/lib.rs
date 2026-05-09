@@ -11,7 +11,9 @@
 //! is byte-transparent (verified in the `smoke/` Phase 0 crate), so all this
 //! module does is shovel bytes between the four streams without translation.
 
+pub mod adapter;
 pub mod inject;
 pub mod runner;
 
+pub use adapter::{Adapter, AiderAdapter, ClaudeAdapter, CodexAdapter, GenericAdapter};
 pub use runner::PtyRunner;

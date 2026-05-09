@@ -26,7 +26,7 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
-use crate::inject;
+use crate::adapter;
 
 /// What the user is asking for. Kept small so the CLI layer stays thin.
 pub struct PtyRunnerConfig {
@@ -58,6 +58,16 @@ impl PtyRunner {
         if cfg.argv.is_empty() {
             return Err(anyhow!("argv is empty — nothing to run"));
         }
+
+        // Pick adapter from program name. The CLI sets cfg.program from
+        // either an explicit --program flag or the basename of argv[0].
+        let adapter_box = adapter::pick(&cfg.program);
+        info!(
+            "using '{}' adapter for program '{}'",
+            adapter_box.name(),
+            cfg.program
+        );
+        let adapter_arc: Arc<dyn adapter::Adapter> = Arc::from(adapter_box);
 
         // ---- 1. Connect to bus + register ------------------------------------
         let sock = socket_path()?;
@@ -197,6 +207,7 @@ impl PtyRunner {
         let bus_tx = write_tx.clone();
         let bus_read_clone = Arc::clone(&bus_read);
         let bus_write_clone = Arc::clone(&bus_write);
+        let adapter_for_bus = Arc::clone(&adapter_arc);
         let bus_to_pty = tokio::spawn(async move {
             loop {
                 let req = BusRequest::Read {
@@ -209,7 +220,7 @@ impl PtyRunner {
                 }
                 match recv_response(&bus_read_clone).await {
                     Ok(BusResponse::Message { message }) => {
-                        let bytes = inject::format_for_injection(&message);
+                        let bytes = adapter_for_bus.format_message(&message);
                         if bus_tx
                             .send(PtyWrite::BusMessage(bytes))
                             .await
