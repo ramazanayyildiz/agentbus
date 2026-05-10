@@ -7,10 +7,16 @@ members = ["cargo:."]
 cargo-dist-version = "0.31.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell", "homebrew"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# The installers to generate for each app.
+# No PowerShell — we don't support native Windows (Unix sockets + PTY
+# ioctl are core to the design). Windows users can still install the
+# linux-gnu binary via WSL.
+installers = ["shell", "homebrew"]
+# Target platforms (Rust target-triple syntax). Unix-only by design —
+# the daemon uses Unix sockets, the runner uses libc::ioctl/termios for
+# raw mode and PTY size detection. Adding Windows would require named
+# pipes + ConPTY and a separate raw-mode implementation; not in scope.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in.
 # ~/.local/bin works for non-Rust users (XDG-friendly, on PATH in most
 # shells). Rust users with ~/.cargo/bin in PATH still benefit; this is
