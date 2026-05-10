@@ -1,7 +1,6 @@
 use agentbus_core::{
     ensure_agentbus_dir, pid_file_path, socket_path, BusRequest, BusResponse, Database,
 };
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
@@ -366,16 +365,25 @@ async fn dispatch_request<W: MessageWriter>(
             model,
             project,
         } => {
-            // Reject duplicate registrations so a second connection can't
-            // steal the push channel from the first (Issue 4).
-            {
-                let map = clients.lock().await;
-                if map.contains_key(&name) {
-                    return Ok(Some(BusResponse::Error {
-                        message: format!("agent '{}' already connected", name),
-                    }));
-                }
-            }
+            // Reattach-on-Register: if the name is already in the clients
+            // map, the previous connection is either dead (waiting for
+            // the dispatch-side socket-EOF detection to fire, up to 30s
+            // post-disconnect with the current Read{wait} timeout) or the
+            // user is reattaching from a fresh wrapper after Ctrl+C.
+            //
+            // Either way, evict the old slot and let the new connection
+            // take over. The old connection's push channel closes; its
+            // next try_send fails; daemon cleans up that side too. mosh
+            // / screen reattach style.
+            //
+            // This relaxes the original "Issue 4" rule (refuse duplicate
+            // Register). The motivation back then was "don't let a
+            // second client steal the push channel from a live first
+            // client." In single-user local IPC this is a worse UX than
+            // it's worth — the more common case is the user Ctrl+C-d
+            // their wrapper and immediately relaunched with the same
+            // name, hitting "already connected" because the daemon
+            // hadn't noticed the old socket was dead yet.
 
             let name_c = name.clone();
             let program_c = program.clone();
@@ -388,21 +396,16 @@ async fn dispatch_request<W: MessageWriter>(
 
             match agent_result {
                 Ok(agent) => {
-                    // Insert push channel via `entry()` so we still refuse
-                    // if a race sneaked another connection in between the
-                    // check above and now.
                     let (tx, rx_new) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
                     let mut map = clients.lock().await;
-                    match map.entry(name.clone()) {
-                        Entry::Occupied(_) => {
-                            return Ok(Some(BusResponse::Error {
-                                message: format!("agent '{}' already connected", name),
-                            }));
-                        }
-                        Entry::Vacant(slot) => {
-                            slot.insert(tx);
-                        }
+                    if let Some(old_tx) = map.remove(&name) {
+                        // Drop the old sender; the previous connection's
+                        // receiver wakes up with None and the runner /
+                        // bus_to_pty task treats it as connection lost.
+                        drop(old_tx);
+                        info!("evicted previous connection for '{}' (reattach)", name);
                     }
+                    map.insert(name.clone(), tx);
                     drop(map);
 
                     *agent_name = Some(name.clone());

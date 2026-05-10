@@ -474,7 +474,11 @@ async fn run_bus_loop(
     loop {
         let req = BusRequest::Read {
             wait: Some(true),
-            timeout_secs: Some(300),
+            // Short enough that the daemon notices a dead wrapper within
+            // ~30s (Read{wait:true} is the common state when a wrapper
+            // dies during Ctrl+C), long enough not to thrash the daemon
+            // with re-Read traffic on idle connections.
+            timeout_secs: Some(30),
         };
         if let Err(e) = send_request(bus_write, &req).await {
             return InnerExit::ConnectionLost(format!("send: {}", e));

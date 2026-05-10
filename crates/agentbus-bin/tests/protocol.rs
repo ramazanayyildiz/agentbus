@@ -344,10 +344,22 @@ async fn f006_send_and_read_full_flow() {
 }
 
 // ===========================================================================
-// F-007 — Duplicate Register is refused (Issue 4 regression)
+// F-007 — Duplicate Register reattaches (replaces old "refused" behavior)
+//
+// Original Issue-4 fix refused duplicate Register so a second client
+// couldn't steal the push channel from a live first client. In practice
+// the much more common case is that the user Ctrl+C-d the previous
+// wrapper and immediately relaunched with the same name — and the
+// daemon hadn't noticed the old socket was dead yet, so the user hit
+// "already connected" gratuitously.
+//
+// New semantics: Register evicts the previous connection's push slot
+// and assigns the new connection. Old connection's push channel
+// receiver wakes up with None on its next recv() and exits cleanly.
+// mosh / screen reattach style.
 // ===========================================================================
 #[tokio::test(flavor = "multi_thread")]
-async fn f007_duplicate_register_refused() {
+async fn f007_duplicate_register_reattaches() {
     let daemon = TestDaemon::start();
     let mut conn1 = daemon.connect().await;
     let resp1 = send_recv(&mut conn1, &register_req("alice")).await;
@@ -355,15 +367,14 @@ async fn f007_duplicate_register_refused() {
 
     let mut conn2 = daemon.connect().await;
     let resp2 = send_recv(&mut conn2, &register_req("alice")).await;
-    match resp2 {
-        BusResponse::Error { message } => {
-            assert!(
-                message.contains("already connected"),
-                "unexpected error message: {message}"
-            );
-        }
-        other => panic!("expected Error, got {other:?}"),
-    }
+    assert!(
+        matches!(resp2, BusResponse::Ok { .. }),
+        "expected Ok (reattach), got {resp2:?}"
+    );
+
+    // The new connection (conn2) now owns the push channel. A Send to
+    // alice should be deliverable via conn2's Read{wait}.
+    // (Simple smoke — full flow is covered by f003/f004.)
 }
 
 // ===========================================================================
