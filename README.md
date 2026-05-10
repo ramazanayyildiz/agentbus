@@ -34,16 +34,54 @@ The daemon owns the routing + persistence. The `agentbus run` wrapper owns
 the PTY of the agent it wraps and bridges bus messages into the agent's
 terminal as if they were typed.
 
+## Install
+
+### One-line install (macOS, Linux)
+
+```sh
+curl -LsSf https://github.com/ramazanayyildiz/agentbus/releases/latest/download/agentbus-installer.sh | sh
+```
+
+Drops `agentbus`, `agentbusd`, and `agentbus-mcp` into `~/.local/bin/`.
+
+### Homebrew (macOS / Linuxbrew)
+
+```sh
+brew install ramazanayyildiz/agentbus/agentbus
+```
+
+(once the tap is published — see [release process](#release-process))
+
+### Windows (PowerShell)
+
+```powershell
+powershell -c "irm https://github.com/ramazanayyildiz/agentbus/releases/latest/download/agentbus-installer.ps1 | iex"
+```
+
+### From source (any platform with Rust)
+
+```sh
+git clone https://github.com/ramazanayyildiz/agentbus
+cd agentbus
+cargo install --path crates/agentbus-bin
+```
+
+### Manual download
+
+Binaries for every release are at
+[github.com/ramazanayyildiz/agentbus/releases](https://github.com/ramazanayyildiz/agentbus/releases).
+Pick the tarball for your platform, extract, drop the three binaries
+somewhere on `PATH`.
+
 ## Architecture
 
-Four crates in a workspace:
+Three crates in a workspace:
 
-| Crate           | Role                                                            |
-|-----------------|-----------------------------------------------------------------|
-| `agentbus-core` | Shared types, SQLite schema, request/response protocol          |
-| `agentbusd`     | Async tokio daemon, listens on `~/.agentbus/agentbus.sock`     |
-| `agentbus-cli`  | `agentbus` CLI binary (start, register, send, read, run, ...)   |
-| `agentbus-pty`  | PtyRunner — wraps an agent process, bridges PTY ↔ bus           |
+| Crate           | Role                                                                     |
+|-----------------|--------------------------------------------------------------------------|
+| `agentbus-core` | Shared types, SQLite schema, request/response protocol                   |
+| `agentbus-pty`  | PtyRunner — wraps an agent process, bridges PTY ↔ bus                    |
+| `agentbus`      | Three binaries: `agentbus` (CLI), `agentbusd` (daemon), `agentbus-mcp`   |
 
 Plus an end-to-end integration test crate at `tests/`.
 
@@ -231,6 +269,35 @@ The `smoke/` directory has a self-contained PoC:
 
 `smoke/mock_agent.rs` is the easiest way to reason about what the inner
 agent is actually receiving — it ignores nothing and prints everything.
+
+## Release process
+
+Releases are managed by [`cargo-dist`](https://opensource.axo.dev/cargo-dist/).
+On a tag push that matches `v*`, the GitHub Actions workflow at
+`.github/workflows/release.yml` builds binaries for five platforms
+(macOS arm64+x64, Linux x64+arm64, Windows x64), generates installer
+scripts, builds the Homebrew formula, and attaches everything to a
+GitHub Release.
+
+To cut a release:
+
+```sh
+# 1. Bump version in workspace.package (Cargo.toml)
+# 2. Commit + push
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The workflow takes ~5–10 minutes and produces:
+
+  - `agentbus-installer.sh`    — `curl | sh` script for Unix
+  - `agentbus-installer.ps1`   — PowerShell installer for Windows
+  - `agentbus.rb`              — Homebrew formula
+  - `agentbus-<target>.tar.xz` — tarball with `agentbus`, `agentbusd`, `agentbus-mcp`
+  - `sha256.sum`               — checksums
+
+Re-running the workflow with a new tag updates the `latest` symlinks the
+install URLs in this README rely on.
 
 ## License
 

@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "agentbus-cli"
+name = "agentbus"
 version = "0.1.0"
 dependencies = [
  "agentbus-core",
@@ -11,10 +11,16 @@ dependencies = [
  "anyhow",
  "clap",
  "dirs",
+ "libc",
  "nix 0.28.0",
+ "rusqlite",
  "serde",
  "serde_json",
+ "serial_test",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -46,20 +52,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agentbus-mcp"
-version = "0.1.0"
-dependencies = [
- "agentbus-core",
- "anyhow",
- "clap",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "agentbus-pty"
 version = "0.1.0"
 dependencies = [
@@ -71,25 +63,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "agentbusd"
-version = "0.1.0"
-dependencies = [
- "agentbus-core",
- "anyhow",
- "dirs",
- "libc",
- "rusqlite",
- "serde",
- "serde_json",
- "serial_test",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -1,0 +1,51 @@
+[package]
+name = "agentbus"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+description.workspace = true
+homepage.workspace = true
+
+# Three binaries shipped together so cargo-dist produces one archive per
+# platform with all three executables. End users get one install command,
+# one tarball, three programs:
+#   - agentbus       — CLI client (the user-facing tool)
+#   - agentbusd      — long-lived daemon (launched by `agentbus start`)
+#   - agentbus-mcp   — MCP server (launched by hosts via .mcp.json)
+
+[[bin]]
+name = "agentbus"
+path = "src/bin/agentbus.rs"
+
+[[bin]]
+name = "agentbusd"
+path = "src/bin/agentbusd.rs"
+
+[[bin]]
+name = "agentbus-mcp"
+path = "src/bin/agentbus-mcp.rs"
+
+[dependencies]
+agentbus-core = { path = "../agentbus-core" }
+agentbus-pty = { path = "../agentbus-pty" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json.workspace = true
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+clap = { workspace = true }
+dirs = "5"
+nix = { version = "0.28", features = ["signal"] }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util", "macros"] }
+serde_json = "1"
+agentbus-core = { path = "../agentbus-core" }
+rusqlite = { workspace = true }
+serial_test = "3"

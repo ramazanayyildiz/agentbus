@@ -1,11 +1,15 @@
 [workspace]
-members = ["crates/agentbus-core", "crates/agentbusd", "crates/agentbus-cli", "crates/agentbus-pty", "crates/agentbus-mcp", "tests"]
+members = ["crates/agentbus-core", "crates/agentbus-pty", "crates/agentbus-bin", "tests"]
 resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["Ram"]
+repository = "https://github.com/ramazanayyildiz/agentbus"
+homepage = "https://github.com/ramazanayyildiz/agentbus"
+license = "MIT"
+description = "Message bus for AI coding agents — Claude Code, Codex, Aider, opencode — letting them talk to each other through PTY injection or MCP."
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -21,3 +25,8 @@ anyhow = "1"
 thiserror = "1"
 portable-pty = "0.8"
 libc = "0.2"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
