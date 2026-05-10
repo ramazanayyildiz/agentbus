@@ -523,8 +523,16 @@ async fn run_bus_loop(
                 if message.contains("timeout") {
                     continue;
                 }
-                warn!("bus error: {}", message);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Any other error means our connection state on the daemon
+                // is no longer usable: typically "Not registered" after
+                // an eviction (a fresh wrapper with the same name took
+                // our slot), or a daemon-side rejection of this Read.
+                // Don't retry on the same broken connection — bail out
+                // so the outer reconnect loop opens a fresh socket and
+                // re-Registers cleanly. Returning early kills the
+                // every-500ms WARN spam that was corrupting host TUIs
+                // by flooding stderr.
+                return InnerExit::ConnectionLost(format!("bus error: {}", message));
             }
             Err(e) => {
                 return InnerExit::ConnectionLost(format!("recv: {}", e));

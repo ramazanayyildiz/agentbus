@@ -237,16 +237,36 @@ where
                 // Client disconnected — release any claims, drop the push
                 // channel slot, and mark the agent as Disconnected so
                 // `agentbus status` reflects reality.
+                //
+                // Eviction race: a fresh connection with the same name may
+                // have already taken our slot in `clients` (Register
+                // handler reattach path drops our tx). If that happened,
+                // our local rx has all-senders-dropped → `is_closed()`
+                // returns true. In that case the slot in the map is no
+                // longer ours; we must NOT remove it (would clobber the
+                // fresh connection) and we must NOT mark_disconnected
+                // (would lie about the agent — the fresh connection is
+                // alive and healthy).
+                let we_were_evicted =
+                    rx.as_ref().map(|r| r.is_closed()).unwrap_or(false);
                 if let Some(ref name) = agent_name {
-                    {
-                        let mut map = clients.lock().await;
-                        map.remove(name);
+                    if !we_were_evicted {
+                        {
+                            let mut map = clients.lock().await;
+                            map.remove(name);
+                        }
+                        let name_release = name.clone();
+                        let _ =
+                            db_call(db, move |d| d.release_all_claims_for(&name_release)).await;
+                        let name_disc = name.clone();
+                        let _ = db_call(db, move |d| d.mark_disconnected(&name_disc)).await;
+                        info!("Agent {} disconnected", name);
+                    } else {
+                        info!(
+                            "Agent {} reachability/short connection ended (slot owned by another connection — leaving map untouched)",
+                            name
+                        );
                     }
-                    let name_release = name.clone();
-                    let _ = db_call(db, move |d| d.release_all_claims_for(&name_release)).await;
-                    let name_disc = name.clone();
-                    let _ = db_call(db, move |d| d.mark_disconnected(&name_disc)).await;
-                    info!("Agent {} disconnected", name);
                 }
                 return Ok(LoopOutcome::Exit);
             }
@@ -356,34 +376,28 @@ async fn handle_client(
     .await;
 
     // Cleanup. Runs whether the loop returned Ok(Exit) (clean EOF —
-    // handle_one_iteration already removed from clients map and called
-    // mark_disconnected; this block is a no-op idempotent fallback)
-    // OR Err (timeout-write-fail or other I/O fault — the in-loop path
-    // never ran). We always do mark_disconnected + clients.remove here,
-    // and release_all_claims_for, so re-Register reattach works
-    // immediately and `agentbus status` reflects truth.
+    // handle_one_iteration already did its half) or Err (timeout-write-
+    // fail or other I/O fault — the in-loop path never ran). The
+    // eviction-aware check below is the same one used in the in-loop
+    // EOF path; see the long-form comment there.
+    let we_were_evicted = rx.as_ref().map(|r| r.is_closed()).unwrap_or(false);
     if let Some(name) = agent_name.as_ref() {
-        {
-            let mut map = clients.lock().await;
-            // Only remove if still ours — eviction by a fresh Register
-            // already swapped the slot to a different tx; we mustn't
-            // clobber the new owner.
-            //
-            // Heuristic: rx is the matching receiver for the tx in
-            // map. Comparing identity is hard; instead we compare via
-            // a sentinel (we set rx to None on eviction below in the
-            // Register handler? Actually no — eviction drops the old
-            // tx which closes the OLD rx). Cheap proxy: if rx is None
-            // here, we were already evicted; leave map alone.
-            if rx.is_some() {
+        if !we_were_evicted {
+            {
+                let mut map = clients.lock().await;
                 map.remove(name);
             }
+            let name_clone = name.clone();
+            let _ = db_call(&db, move |d| d.release_all_claims_for(&name_clone)).await;
+            let name_disc = name.clone();
+            let _ = db_call(&db, move |d| d.mark_disconnected(&name_disc)).await;
+            info!("Agent {} cleanup complete (handle_client exit)", name);
+        } else {
+            info!(
+                "Agent {} handle_client exit while evicted — slot left intact",
+                name
+            );
         }
-        let name_clone = name.clone();
-        let _ = db_call(&db, move |d| d.release_all_claims_for(&name_clone)).await;
-        let name_disc = name.clone();
-        let _ = db_call(&db, move |d| d.mark_disconnected(&name_disc)).await;
-        info!("Agent {} cleanup complete (handle_client exit)", name);
     }
 
     result
