@@ -56,6 +56,18 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(Mutex::new(Database::init()?));
     info!("Database initialized");
 
+    // Sweep stale "active" agents on startup. Anyone previously connected
+    // is by definition disconnected now (their bus socket went away when
+    // we restarted). Without this `agentbus status` shows zombies.
+    {
+        let guard = db.lock().await;
+        match guard.mark_all_active_as_disconnected() {
+            Ok(n) if n > 0 => info!("marked {} stale agents as disconnected on startup", n),
+            Ok(_) => {}
+            Err(e) => warn!("startup disconnected-sweep failed: {}", e),
+        }
+    }
+
     // Write our PID file (claims the bus_dir).
     let pid = std::process::id();
     fs::write(&pid_path, pid.to_string())?;
@@ -223,15 +235,18 @@ where
         read_res = reader.read_line(line_buf) => {
             let n = read_res?;
             if n == 0 {
-                // Client disconnected — release any claims and the push
-                // channel slot.
+                // Client disconnected — release any claims, drop the push
+                // channel slot, and mark the agent as Disconnected so
+                // `agentbus status` reflects reality.
                 if let Some(ref name) = agent_name {
                     {
                         let mut map = clients.lock().await;
                         map.remove(name);
                     }
-                    let name_clone = name.clone();
-                    let _ = db_call(db, move |d| d.release_all_claims_for(&name_clone)).await;
+                    let name_release = name.clone();
+                    let _ = db_call(db, move |d| d.release_all_claims_for(&name_release)).await;
+                    let name_disc = name.clone();
+                    let _ = db_call(db, move |d| d.mark_disconnected(&name_disc)).await;
                     info!("Agent {} disconnected", name);
                 }
                 return Ok(LoopOutcome::Exit);

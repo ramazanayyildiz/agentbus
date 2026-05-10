@@ -39,6 +39,13 @@ pub enum AgentState {
     /// agents in this state and re-registering flips state back to Active.
     #[serde(rename = "unregistered")]
     Unregistered,
+    /// Agent's bus socket connection has dropped (connection lost, daemon
+    /// restart, agent crash). Distinguished from Unregistered because the
+    /// agent didn't explicitly Close — they could come back. Messages
+    /// continue to queue against this agent so they're delivered on
+    /// reconnect.
+    #[serde(rename = "disconnected")]
+    Disconnected,
 }
 
 impl AgentState {
@@ -50,6 +57,7 @@ impl AgentState {
             AgentState::Done => "done",
             AgentState::Error => "error",
             AgentState::Unregistered => "unregistered",
+            AgentState::Disconnected => "disconnected",
         }
     }
 
@@ -65,6 +73,7 @@ impl AgentState {
             "done" => Ok(AgentState::Done),
             "error" => Ok(AgentState::Error),
             "unregistered" => Ok(AgentState::Unregistered),
+            "disconnected" => Ok(AgentState::Disconnected),
             other => Err(BusError::InvalidAgentState(other.to_string())),
         }
     }
@@ -337,6 +346,43 @@ impl Database {
             rusqlite::params![AgentState::Unregistered.as_str(), name],
         )?;
         Ok(())
+    }
+
+    /// Mark an agent as disconnected — the bus socket dropped without an
+    /// explicit Close/Unregister. Distinct from Unregistered: the agent
+    /// could reconnect, and messages keep queuing against this name.
+    pub fn mark_disconnected(&self, name: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE agents SET state = ?1
+             WHERE name = ?2
+               AND state NOT IN (?3, ?1)",
+            rusqlite::params![
+                AgentState::Disconnected.as_str(),
+                name,
+                AgentState::Unregistered.as_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sweep on daemon startup: mark every agent that's currently in any
+    /// "live" state as Disconnected. Agents that explicitly Unregistered
+    /// are left alone — we don't want to resurrect them. The next Register
+    /// call from a real client flips state back to Active.
+    ///
+    /// Without this, the agents table accumulates phantom "active" rows
+    /// from previous daemon runs and `agentbus status` lies about who's
+    /// actually online.
+    pub fn mark_all_active_as_disconnected(&self) -> anyhow::Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE agents SET state = ?1
+             WHERE state NOT IN (?2, ?1)",
+            rusqlite::params![
+                AgentState::Disconnected.as_str(),
+                AgentState::Unregistered.as_str(),
+            ],
+        )?;
+        Ok(n)
     }
 
     pub fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
