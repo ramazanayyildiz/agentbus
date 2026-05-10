@@ -15,5 +15,7 @@ pub mod adapter;
 pub mod inject;
 pub mod runner;
 
-pub use adapter::{Adapter, AiderAdapter, ClaudeAdapter, CodexAdapter, GenericAdapter};
+pub use adapter::{
+    Adapter, AiderAdapter, ClaudeAdapter, CodexAdapter, GenericAdapter, OpencodeAdapter,
+};
 pub use runner::PtyRunner;

@@ -107,6 +107,26 @@ impl Adapter for CodexAdapter {
     }
 }
 
+/// opencode adapter. Modern Bun TUI; verified in real-world test that
+/// envelope renders inside its input field. We use bracketed paste so the
+/// envelope is grouped as one block instead of being interpreted as
+/// individual keystrokes (which would trip the slash-command autocomplete).
+pub struct OpencodeAdapter;
+
+impl Adapter for OpencodeAdapter {
+    fn name(&self) -> &'static str {
+        "opencode"
+    }
+
+    fn format_message(&self, msg: &Message) -> Vec<u8> {
+        bracketed_paste_envelope(msg)
+    }
+
+    fn idle_ms_before_inject(&self) -> u64 {
+        750
+    }
+}
+
 /// Aider adapter. Aider has a readline-style prompt so plain envelope + CR
 /// is the cleanest delivery — bracketed paste would render as visible
 /// markers in the buffer.
@@ -142,6 +162,10 @@ pub fn pick(program: &str) -> Box<dyn Adapter> {
         Box::new(ClaudeAdapter)
     } else if p.contains("codex") {
         Box::new(CodexAdapter)
+    } else if p.contains("opencode") {
+        // Order matters: must check "opencode" before any partial match
+        // for "code" (none today, but defensive). Check before generic.
+        Box::new(OpencodeAdapter)
     } else if p.contains("aider") {
         Box::new(AiderAdapter)
     } else {
@@ -204,7 +228,18 @@ mod tests {
         assert_eq!(pick("/usr/local/bin/claude").name(), "claude");
         assert_eq!(pick("codex resume xyz --yolo").name(), "codex");
         assert_eq!(pick("aider").name(), "aider");
+        assert_eq!(pick("opencode").name(), "opencode");
+        assert_eq!(pick("/usr/local/bin/opencode --tui").name(), "opencode");
         assert_eq!(pick("vim").name(), "generic");
+    }
+
+    #[test]
+    fn opencode_uses_bracketed_paste_and_idle_gating() {
+        let bytes = OpencodeAdapter.format_message(&msg("hi"));
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
+        assert_eq!(bytes.last(), Some(&b'\r'));
+        assert_eq!(OpencodeAdapter.idle_ms_before_inject(), 750);
     }
 
     #[test]
