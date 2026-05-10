@@ -52,13 +52,13 @@ brew install ramazanayyildiz/agentbus/agentbus
 
 (once the tap is published — see [release process](#release-process))
 
-### Windows (PowerShell)
+### Windows
 
-```powershell
-powershell -c "irm https://github.com/ramazanayyildiz/agentbus/releases/latest/download/agentbus-installer.ps1 | iex"
-```
+Native Windows isn't supported — the daemon uses Unix sockets and the
+PTY runner uses Unix-specific terminal control APIs. Use **WSL** and
+follow the Linux instructions inside it.
 
-### From source (any platform with Rust)
+### From source (any Unix platform with Rust)
 
 ```sh
 git clone https://github.com/ramazanayyildiz/agentbus
