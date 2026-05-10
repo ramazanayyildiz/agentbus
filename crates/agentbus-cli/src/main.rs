@@ -90,11 +90,18 @@ enum Commands {
     /// Wrap a command in a PTY, register it on the bus, and bridge bus
     /// messages into the wrapped process. Use `--` to separate flags from
     /// the target command, e.g.:
+    ///   agentbus run -- claude --dangerously-skip-permissions
     ///   agentbus run --name codex -- codex resume <id> --yolo
+    ///
+    /// If --name is omitted, it's auto-derived from the basename of the
+    /// wrapped command (e.g. `agentbus run -- claude ...` registers as
+    /// "claude"). If that name is already connected on the bus, a numeric
+    /// suffix is appended ("claude-2", "claude-3", ...).
     Run {
-        /// Agent name to register on the bus
+        /// Agent name to register on the bus. Auto-derived from argv[0]
+        /// basename when omitted.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
 
         /// Program type (used for adapter selection in Phase 2; informational
         /// in Phase 1). Defaults to argv[0] of the wrapped command.
@@ -194,7 +201,7 @@ fn main() -> anyhow::Result<()> {
 /// a multi-thread runtime locally rather than #[tokio::main]ing the whole
 /// binary. Keeps the other subcommands' startup latency unchanged.
 fn cmd_run(
-    name: String,
+    name: Option<String>,
     program: Option<String>,
     model: String,
     project: String,
@@ -214,13 +221,23 @@ fn cmd_run(
     if argv.is_empty() {
         return Err(anyhow::anyhow!("`run` requires a command after --"));
     }
-    let program = program.unwrap_or_else(|| {
-        std::path::Path::new(&argv[0])
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown")
-            .to_string()
-    });
+    let basename = std::path::Path::new(&argv[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let program = program.unwrap_or_else(|| basename.clone());
+
+    // Auto-name when --name was omitted: use the basename, but if that's
+    // already a live (connected) agent on the bus, append a numeric suffix.
+    // Preserves the "no two agents with the same name connected at once"
+    // invariant the daemon enforces, without making the user think up
+    // distinct names every time they wrap a session.
+    let name = match name {
+        Some(n) => n,
+        None => pick_unique_name(&basename)?,
+    };
+    eprintln!("agentbus: registering as '{}'", name);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -495,6 +512,52 @@ fn cmd_close(name: &str) -> anyhow::Result<()> {
         BusResponse::Error { message } => Err(anyhow::anyhow!(message)),
         _ => Err(anyhow::anyhow!("Unexpected response")),
     }
+}
+
+/// Pick a name that's not currently live (state='active') on the bus.
+/// Tries the basename first, then basename-2, basename-3, ... up to 100.
+/// Falls back to basename-<pid> if we hit the cap or the daemon is
+/// unreachable — better to register with a probably-unique name than to
+/// fail outright.
+fn pick_unique_name(basename: &str) -> anyhow::Result<String> {
+    // Get the current agent list. If the daemon isn't running we can't
+    // probe — return the basename and let the runner's startup phase
+    // surface the real error.
+    let req = BusRequest::List;
+    let resp = match send_request(&req) {
+        Ok(r) => r,
+        Err(_) => return Ok(basename.to_string()),
+    };
+    let agents: Vec<serde_json::Value> = match resp {
+        BusResponse::Ok { data } => serde_json::from_value(data).unwrap_or_default(),
+        _ => return Ok(basename.to_string()),
+    };
+
+    // Build a set of "currently active" names — only those count as
+    // collisions because the daemon allows reusing names that are
+    // disconnected/unregistered (re-register flips state back to Active).
+    let live: std::collections::HashSet<String> = agents
+        .iter()
+        .filter(|v| v.get("state").and_then(|s| s.as_str()) == Some("active"))
+        .filter_map(|v| {
+            v.get("name")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+
+    if !live.contains(basename) {
+        return Ok(basename.to_string());
+    }
+    for n in 2..=100 {
+        let candidate = format!("{}-{}", basename, n);
+        if !live.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    // Cap reached — fall back to PID suffix. Extremely unlikely, but
+    // better than hanging or erroring.
+    Ok(format!("{}-{}", basename, std::process::id()))
 }
 
 fn cmd_status() -> anyhow::Result<()> {
