@@ -328,22 +328,65 @@ async fn handle_client(
     let mut agent_name: Option<String> = None;
     let mut rx: Option<mpsc::Receiver<agentbus_core::Message>> = None;
 
-    loop {
-        match handle_one_iteration(
-            &mut reader,
-            &mut writer,
-            &db,
-            &clients,
-            &mut agent_name,
-            &mut rx,
-            &mut line,
-        )
-        .await?
-        {
-            LoopOutcome::Continue => continue,
-            LoopOutcome::Exit => return Ok(()),
+    // Run the per-iteration loop and capture any error; ALWAYS run the
+    // cleanup block below so DB state and the clients map don't go stale
+    // when an iteration fails (write to dead socket, parse error chain,
+    // any future I/O fault). Without this the agent would stay 'active'
+    // in `agentbus status` until something else evicts it — sometimes
+    // never. Found the gap when wrapper SIGTERM left the agent stuck
+    // 'active' for >35s post-Read{wait}-timeout.
+    let result: anyhow::Result<()> = async {
+        loop {
+            match handle_one_iteration(
+                &mut reader,
+                &mut writer,
+                &db,
+                &clients,
+                &mut agent_name,
+                &mut rx,
+                &mut line,
+            )
+            .await?
+            {
+                LoopOutcome::Continue => continue,
+                LoopOutcome::Exit => return Ok(()),
+            }
         }
     }
+    .await;
+
+    // Cleanup. Runs whether the loop returned Ok(Exit) (clean EOF —
+    // handle_one_iteration already removed from clients map and called
+    // mark_disconnected; this block is a no-op idempotent fallback)
+    // OR Err (timeout-write-fail or other I/O fault — the in-loop path
+    // never ran). We always do mark_disconnected + clients.remove here,
+    // and release_all_claims_for, so re-Register reattach works
+    // immediately and `agentbus status` reflects truth.
+    if let Some(name) = agent_name.as_ref() {
+        {
+            let mut map = clients.lock().await;
+            // Only remove if still ours — eviction by a fresh Register
+            // already swapped the slot to a different tx; we mustn't
+            // clobber the new owner.
+            //
+            // Heuristic: rx is the matching receiver for the tx in
+            // map. Comparing identity is hard; instead we compare via
+            // a sentinel (we set rx to None on eviction below in the
+            // Register handler? Actually no — eviction drops the old
+            // tx which closes the OLD rx). Cheap proxy: if rx is None
+            // here, we were already evicted; leave map alone.
+            if rx.is_some() {
+                map.remove(name);
+            }
+        }
+        let name_clone = name.clone();
+        let _ = db_call(&db, move |d| d.release_all_claims_for(&name_clone)).await;
+        let name_disc = name.clone();
+        let _ = db_call(&db, move |d| d.mark_disconnected(&name_disc)).await;
+        info!("Agent {} cleanup complete (handle_client exit)", name);
+    }
+
+    result
 }
 
 /// Dispatch a parsed `BusRequest`. Returns `Ok(Some(resp))` if a normal
