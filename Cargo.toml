@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/agentbus-core", "crates/agentbusd", "crates/agentbus-cli", "crates/agentbus-pty", "tests"]
+members = ["crates/agentbus-core", "crates/agentbusd", "crates/agentbus-cli", "crates/agentbus-pty", "crates/agentbus-mcp", "tests"]
 resolver = "2"
 
 [workspace.package]
