@@ -435,6 +435,41 @@ fn m010_unregister_agent_soft_deletes() {
 }
 
 // ---------------------------------------------------------------------------
+// M-010c — mark_disconnected vs mark_all_active_as_disconnected
+//
+// Verifies the dead-connection-sweep behavior. After daemon restart, all
+// "live" rows should flip to Disconnected without disturbing any rows
+// that were explicitly Unregistered (which means the agent asked to be
+// removed, not that they crashed).
+// ---------------------------------------------------------------------------
+#[test]
+#[serial]
+fn m010c_disconnected_sweep_skips_unregistered_rows() {
+    let (db, _tmp) = fresh_db();
+    db.register_agent("alice", "p", "m", "proj").unwrap();
+    db.register_agent("bob", "p", "m", "proj").unwrap();
+    db.register_agent("carol", "p", "m", "proj").unwrap();
+
+    // Carol explicitly Unregistered — sweep must NOT resurrect her.
+    db.unregister_agent("carol").unwrap();
+
+    let n = db.mark_all_active_as_disconnected().unwrap();
+    assert_eq!(n, 2, "alice + bob should be swept; carol left alone");
+
+    let alice = db.get_agent("alice").unwrap().unwrap();
+    let bob = db.get_agent("bob").unwrap().unwrap();
+    let carol = db.get_agent("carol").unwrap().unwrap();
+    assert_eq!(alice.state, agentbus_core::AgentState::Disconnected);
+    assert_eq!(bob.state, agentbus_core::AgentState::Disconnected);
+    assert_eq!(carol.state, agentbus_core::AgentState::Unregistered);
+
+    // Re-register flips Disconnected back to Active.
+    db.register_agent("alice", "p", "m", "proj").unwrap();
+    let alice = db.get_agent("alice").unwrap().unwrap();
+    assert_eq!(alice.state, agentbus_core::AgentState::Active);
+}
+
+// ---------------------------------------------------------------------------
 // M-010b — unregister doesn't break FKs even after sending messages
 //
 // HIGH-2 regression guard: if we ever go back to DELETE, this test fails
