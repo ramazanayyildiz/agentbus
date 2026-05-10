@@ -9,6 +9,7 @@ dependencies = [
  "agentbus-core",
  "agentbus-pty",
  "anyhow",
+ "chrono",
  "clap",
  "dirs",
  "libc",

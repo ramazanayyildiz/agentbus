@@ -125,6 +125,112 @@ cargo build --release
 #   $ agentbus send --from codex --to atlas --msg-type response "..."
 ```
 
+## Two integration modes
+
+agentbus offers two ways to connect a host to the bus. Pick whichever
+fits your agent.
+
+### Mode A — PTY runner (universal)
+
+`agentbus run` wraps any terminal-based agent in a pseudo-terminal,
+auto-registers it on the bus, and injects incoming messages as if pasted
+by a user. Works for **any** TUI: Claude Code, Codex, aider, opencode,
+and anything else that takes input on stdin.
+
+```bash
+# Most agents — adapter auto-picked from program name
+agentbus run -- claude --dangerously-skip-permissions
+agentbus run -- codex --yolo
+agentbus run -- aider
+agentbus run -- opencode
+```
+
+The wrapper auto-derives the agent's name from `argv[0]`. Pass `--name`
+to override. See [adapter table](#adapter-selection) below.
+
+### Mode B — MCP server (for MCP-aware hosts)
+
+`agentbus-mcp` is a Model Context Protocol server. Configure your host
+to launch it; the host's LLM then has bus tools as first-class tool
+calls — no PTY wrapping, no paste-as-input hacks.
+
+#### Claude Code
+
+Add to `~/.claude/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agentbus": {
+      "command": "agentbus-mcp",
+      "args": ["--name", "claude-main", "--program", "claude", "--model", "opus"]
+    }
+  }
+}
+```
+
+Restart your Claude Code session. The LLM now has `agentbus_send`,
+`agentbus_inbox`, `agentbus_list`, `agentbus_register`, `agentbus_whoami`
+tools available.
+
+#### Warp Terminal
+
+Warp speaks MCP natively (Warp 0.2025+ open-sourced — see [warpdotdev/warp]).
+Drop into `~/.warp/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agentbus": {
+      "command": "agentbus-mcp",
+      "args": ["--name", "warp-main", "--program", "warp"]
+    }
+  }
+}
+```
+
+Warp's own agent **and** any CLI agent it manages (Claude Code, Codex,
+Gemini, opencode plugin marketplace) inherit the bus. See
+[WARP_INTEGRATION.md](WARP_INTEGRATION.md) for deeper details.
+
+#### Codex / opencode
+
+Both speak MCP. Add an entry pointing at `agentbus-mcp` in their
+respective config files (see each agent's docs for the path).
+
+### Mode A vs Mode B
+
+| | PTY runner | MCP server |
+|---|---|---|
+| Universal (any TUI) | ✅ | ❌ MCP-aware hosts only |
+| No session restart needed | ❌ wraps from start | ✅ host launches it |
+| Visible envelope in input field | ✅ | ❌ tool calls invisible |
+| Programmatic mid-task | ❌ user-driven | ✅ host's LLM calls tools |
+| aider | ✅ | ❌ no MCP |
+| Claude Code, Codex, Warp, opencode | ✅ via wrapper | ✅ native, cleaner |
+
+The two modes share the same `agentbusd`, the same SQLite, the same
+agent identities. You can mix and match — wrap aider with PTY runner
+and configure MCP for Claude Code, both talking to each other on the
+same bus.
+
+## Adapter selection
+
+When using PTY runner, the adapter is picked by case-insensitive
+substring match against `--program` (or argv[0] basename when omitted):
+
+| Adapter   | Match     | Format                                       | Idle gate |
+|-----------|-----------|----------------------------------------------|-----------|
+| `claude`  | "claude"  | `\x1b[200~ envelope \x1b[201~\r` (paste)     | 750 ms    |
+| `codex`   | "codex"   | `\x1b[200~ envelope \x1b[201~\r` (paste)     | 750 ms    |
+| `opencode`| "opencode"| `\x1b[200~ envelope \x1b[201~\r` (paste)     | 750 ms    |
+| `aider`   | "aider"   | `envelope\r` (plain, readline-friendly)      | 500 ms    |
+| `generic` | (default) | `envelope\r`                                  | 0 ms      |
+
+The "envelope" is a single line: `[agentbus from=<from> type=<type>[ thread=<id>]] <body>`.
+
+[warpdotdev/warp]: https://github.com/warpdotdev/warp
+
 ## Subcommands
 
 ```

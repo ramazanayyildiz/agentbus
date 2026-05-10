@@ -435,6 +435,102 @@ fn m010_unregister_agent_soft_deletes() {
 }
 
 // ---------------------------------------------------------------------------
+// M-013 — prune_inactive_agents cascades through messages
+//
+// Smoke test for the `agentbus prune` admin path. We seed two agents in
+// pruneable states, send messages between them, and verify that prune
+// removes both the agents AND their messages in one transaction.
+// ---------------------------------------------------------------------------
+#[test]
+#[serial]
+fn m013_prune_deletes_agents_and_their_messages() {
+    let (mut db, _tmp) = fresh_db();
+    db.register_agent("dead-1", "p", "m", "proj").unwrap();
+    db.register_agent("dead-2", "p", "m", "proj").unwrap();
+    db.register_agent("alive-1", "p", "m", "proj").unwrap();
+
+    db.send_message(
+        "dead-1",
+        "alive-1",
+        None,
+        agentbus_core::MessageType::Request,
+        "ping",
+    )
+    .unwrap();
+    db.send_message(
+        "alive-1",
+        "dead-2",
+        None,
+        agentbus_core::MessageType::Response,
+        "pong",
+    )
+    .unwrap();
+    db.send_message(
+        "alive-1",
+        "alive-1",
+        None,
+        agentbus_core::MessageType::Status,
+        "self",
+    )
+    .unwrap();
+
+    db.unregister_agent("dead-1").unwrap(); // -> Unregistered
+    // Force dead-2 into Disconnected the way the daemon would on socket drop.
+    db.mark_disconnected("dead-2").unwrap();
+
+    // Cutoff far in the future so both pruneable agents match.
+    let future_cutoff = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(60))
+        .unwrap()
+        .to_rfc3339();
+
+    let (a, m) = db
+        .prune_inactive_agents(
+            &[
+                agentbus_core::AgentState::Disconnected,
+                agentbus_core::AgentState::Unregistered,
+            ],
+            &future_cutoff,
+        )
+        .unwrap();
+    assert_eq!(a, 2, "should delete dead-1 and dead-2");
+    assert_eq!(m, 2, "should delete the two messages referencing them");
+
+    assert!(!db.agent_exists("dead-1").unwrap());
+    assert!(!db.agent_exists("dead-2").unwrap());
+    assert!(db.agent_exists("alive-1").unwrap());
+
+    // The alive-1 self-message is untouched.
+    let mine = db.fetch_and_claim_messages("alive-1").unwrap();
+    assert_eq!(mine.len(), 1);
+    assert_eq!(mine[0].body, "self");
+}
+
+// ---------------------------------------------------------------------------
+// M-013b — prune respects the cutoff
+//
+// An agent that became Disconnected/Unregistered AFTER the cutoff must
+// be left alone. This protects against accidentally pruning a session
+// that just lost connection.
+// ---------------------------------------------------------------------------
+#[test]
+#[serial]
+fn m013b_prune_respects_cutoff() {
+    let (mut db, _tmp) = fresh_db();
+    db.register_agent("recent", "p", "m", "proj").unwrap();
+    db.unregister_agent("recent").unwrap();
+
+    // Cutoff in the PAST — recent's registered_at is newer than this.
+    let past_cutoff = "2000-01-01T00:00:00+00:00";
+    let (a, m) = db
+        .prune_inactive_agents(&[agentbus_core::AgentState::Unregistered], past_cutoff)
+        .unwrap();
+    assert_eq!(a, 0);
+    assert_eq!(m, 0);
+    assert!(db.agent_exists("recent").unwrap());
+}
+
+// ---------------------------------------------------------------------------
 // M-010c — mark_disconnected vs mark_all_active_as_disconnected
 //
 // Verifies the dead-connection-sweep behavior. After daemon restart, all

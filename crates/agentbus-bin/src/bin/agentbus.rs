@@ -87,6 +87,28 @@ enum Commands {
     /// Show daemon status
     Status,
 
+    /// Prune dead agents (and their messages) from the bus database.
+    /// By default removes agents in `disconnected` and `unregistered`
+    /// state older than 24 hours. Use --dry-run to preview.
+    Prune {
+        /// Comma-separated states to prune. Default: disconnected,unregistered
+        #[arg(long, default_value = "disconnected,unregistered")]
+        state: String,
+
+        /// Delete agents whose registered_at is older than this duration.
+        /// Accepts: 30s, 5m, 2h, 7d. Default: 24h.
+        #[arg(long, default_value = "24h")]
+        older_than: String,
+
+        /// Show what would be deleted without actually deleting.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Confirm without prompting (skip interactive y/n).
+        #[arg(long, short)]
+        yes: bool,
+    },
+
     /// Wrap a command in a PTY, register it on the bus, and bridge bus
     /// messages into the wrapped process. Use `--` to separate flags from
     /// the target command, e.g.:
@@ -167,6 +189,12 @@ fn main() -> anyhow::Result<()> {
         Commands::Read { name, wait, timeout } => cmd_read(name.as_deref(), wait, timeout)?,
         Commands::Close { name } => cmd_close(&name)?,
         Commands::Status => cmd_status()?,
+        Commands::Prune {
+            state,
+            older_than,
+            dry_run,
+            yes,
+        } => cmd_prune(&state, &older_than, dry_run, yes)?,
         Commands::Run {
             name,
             program,
@@ -558,6 +586,105 @@ fn pick_unique_name(basename: &str) -> anyhow::Result<String> {
     // Cap reached — fall back to PID suffix. Extremely unlikely, but
     // better than hanging or erroring.
     Ok(format!("{}-{}", basename, std::process::id()))
+}
+
+/// Parse a short human duration like "30s", "5m", "2h", "7d" into seconds.
+/// Bare digits are treated as seconds. Used by `agentbus prune --older-than`.
+fn parse_duration(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow::anyhow!("empty duration"));
+    }
+    let (num_str, unit_secs): (&str, u64) = if let Some(stripped) = s.strip_suffix('d') {
+        (stripped, 86_400)
+    } else if let Some(stripped) = s.strip_suffix('h') {
+        (stripped, 3_600)
+    } else if let Some(stripped) = s.strip_suffix('m') {
+        (stripped, 60)
+    } else if let Some(stripped) = s.strip_suffix('s') {
+        (stripped, 1)
+    } else {
+        (s, 1)
+    };
+    let n: u64 = num_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("bad duration `{}`: expected forms 30s/5m/2h/7d", s))?;
+    Ok(n.saturating_mul(unit_secs))
+}
+
+/// Prune dead agents from the DB by talking to the daemon's underlying
+/// SQLite directly. We DON'T do this through the daemon protocol because
+/// (a) there's no `Prune` request, and (b) it's an admin operation, not
+/// a bus operation. The daemon's reads are unaffected; the WAL mode keeps
+/// concurrent access safe.
+fn cmd_prune(state: &str, older_than: &str, dry_run: bool, yes: bool) -> anyhow::Result<()> {
+    use agentbus_core::AgentState;
+    let states: Vec<AgentState> = state
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(AgentState::parse)
+        .collect::<Result<_, _>>()?;
+    if states.is_empty() {
+        return Err(anyhow::anyhow!(
+            "--state must list at least one state (e.g. disconnected,unregistered)"
+        ));
+    }
+    let secs = parse_duration(older_than)?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(secs as i64);
+    let cutoff_str = cutoff.to_rfc3339();
+
+    // Open DB directly. WAL means the daemon's reads stay consistent.
+    let mut db = agentbus_core::Database::init()?;
+
+    if dry_run {
+        // Dry-run: list what would be pruned without touching anything.
+        // Done via a fresh connection so we don't accidentally start a
+        // transaction here.
+        let agents = db.list_agents()?;
+        let candidates: Vec<_> = agents
+            .iter()
+            .filter(|a| {
+                states.iter().any(|s| s == &a.state) && a.registered_at.as_str() < cutoff_str.as_str()
+            })
+            .collect();
+        if candidates.is_empty() {
+            println!("No agents match the prune filter.");
+            return Ok(());
+        }
+        println!("Would delete {} agents (and their messages):", candidates.len());
+        for a in candidates {
+            println!(
+                "  {:14}  state={:13}  registered_at={}",
+                a.name,
+                a.state.as_str(),
+                a.registered_at
+            );
+        }
+        println!("\nRe-run without --dry-run to apply.");
+        return Ok(());
+    }
+
+    // Confirmation prompt unless --yes
+    if !yes {
+        eprint!(
+            "Prune agents in state [{}] older than {} (cutoff {}). Continue? [y/N] ",
+            state, older_than, cutoff_str
+        );
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let (agents, messages) = db.prune_inactive_agents(&states, &cutoff_str)?;
+    println!(
+        "Pruned: {} agent(s), {} message(s) deleted.",
+        agents, messages
+    );
+    Ok(())
 }
 
 fn cmd_status() -> anyhow::Result<()> {

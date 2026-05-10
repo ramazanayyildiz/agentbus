@@ -365,6 +365,76 @@ impl Database {
         Ok(())
     }
 
+    /// Permanently delete agents in the given states whose registered_at is
+    /// older than `cutoff_rfc3339`. Cascades through `messages` first
+    /// (HIGH-2 / FK preservation: we can't DELETE from agents while
+    /// messages reference them, so we wipe both within a transaction).
+    ///
+    /// Returns (agents_deleted, messages_deleted).
+    ///
+    /// Pass an empty `states` slice to match nothing (defensive default;
+    /// callers are expected to pass at least one state explicitly).
+    pub fn prune_inactive_agents(
+        &mut self,
+        states: &[AgentState],
+        cutoff_rfc3339: &str,
+    ) -> anyhow::Result<(usize, usize)> {
+        if states.is_empty() {
+            return Ok((0, 0));
+        }
+        let placeholders: Vec<String> = (0..states.len()).map(|i| format!("?{}", i + 2)).collect();
+        let in_clause = placeholders.join(", ");
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+
+        // Snapshot the names we're about to remove so we can target the
+        // messages table cleanly.
+        let select_sql = format!(
+            "SELECT name FROM agents
+             WHERE registered_at < ?1
+               AND state IN ({in_clause})"
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(cutoff_rfc3339.to_string())];
+        for s in states {
+            params.push(Box::new(s.as_str().to_string()));
+        }
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|b| b.as_ref()).collect();
+
+        let names: Vec<String> = {
+            let mut stmt = tx.prepare(&select_sql)?;
+            let rows = stmt.query_map(&param_refs[..], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if names.is_empty() {
+            tx.commit()?;
+            return Ok((0, 0));
+        }
+
+        // Delete referencing messages first.
+        let mut messages_deleted = 0usize;
+        for name in &names {
+            messages_deleted += tx.execute(
+                "DELETE FROM messages WHERE from_agent = ?1 OR to_agent = ?1",
+                rusqlite::params![name],
+            )?;
+        }
+
+        // Then delete the agents themselves. Same WHERE clause as the
+        // SELECT to stay consistent under concurrent updates.
+        let delete_sql = format!(
+            "DELETE FROM agents
+             WHERE registered_at < ?1
+               AND state IN ({in_clause})"
+        );
+        let agents_deleted = tx.execute(&delete_sql, &param_refs[..])?;
+
+        tx.commit()?;
+        Ok((agents_deleted, messages_deleted))
+    }
+
     /// Sweep on daemon startup: mark every agent that's currently in any
     /// "live" state as Disconnected. Agents that explicitly Unregistered
     /// are left alone — we don't want to resurrect them. The next Register
