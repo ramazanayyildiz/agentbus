@@ -74,31 +74,40 @@ impl PtyRunner {
         );
         let adapter_arc: Arc<dyn adapter::Adapter> = Arc::from(adapter_box);
 
-        // ---- 1. Connect to bus + register ------------------------------------
-        let sock = socket_path()?;
-        let bus = UnixStream::connect(&sock)
-            .await
-            .with_context(|| format!("connect to agentbus daemon at {:?}", sock))?;
-        let (bus_read, bus_write) = bus.into_split();
-        let bus_read = Arc::new(Mutex::new(BufReader::new(bus_read)));
-        let bus_write = Arc::new(Mutex::new(bus_write));
-
-        let register = BusRequest::Register {
-            name: cfg.agent_name.clone(),
-            program: cfg.program.clone(),
-            model: cfg.model.clone(),
-            project: cfg.project.clone(),
-        };
-        send_request(&bus_write, &register).await?;
-        let resp = recv_response(&bus_read).await?;
-        match &resp {
-            BusResponse::Ok { .. } => info!("registered '{}' on bus", cfg.agent_name),
-            BusResponse::Error { message } => {
-                return Err(anyhow!("bus registration failed: {}", message));
+        // ---- 1. Quick reachability check -------------------------------------
+        // Open a short-lived connection to the daemon and Register so we
+        // fail fast if the daemon is missing. Then drop this connection —
+        // the bus_to_pty task below owns its own connection and reconnects
+        // on its own when the daemon goes away. This way a daemon restart
+        // mid-session doesn't permanently break message flow to this agent.
+        {
+            let sock = socket_path()?;
+            let bus = UnixStream::connect(&sock)
+                .await
+                .with_context(|| format!("connect to agentbus daemon at {:?}", sock))?;
+            let (read_half, write_half) = bus.into_split();
+            let read = Arc::new(Mutex::new(BufReader::new(read_half)));
+            let write = Arc::new(Mutex::new(write_half));
+            let register = BusRequest::Register {
+                name: cfg.agent_name.clone(),
+                program: cfg.program.clone(),
+                model: cfg.model.clone(),
+                project: cfg.project.clone(),
+            };
+            send_request(&write, &register).await?;
+            let resp = recv_response(&read).await?;
+            match &resp {
+                BusResponse::Ok { .. } => info!("registered '{}' on bus", cfg.agent_name),
+                BusResponse::Error { message } => {
+                    return Err(anyhow!("bus registration failed: {}", message));
+                }
+                BusResponse::Message { .. } => {
+                    return Err(anyhow!("unexpected message response during register"));
+                }
             }
-            BusResponse::Message { .. } => {
-                return Err(anyhow!("unexpected message response during register"));
-            }
+            // Drop this short-lived connection; daemon's disconnect handler
+            // marks the agent Disconnected, which bus_to_pty's reconnect
+            // will flip back to Active when it Registers below.
         }
 
         // ---- 2. Spawn PTY child ---------------------------------------------
@@ -257,84 +266,72 @@ impl PtyRunner {
         // forward Message responses to the PTY. On daemon disconnect we exit
         // with an error.
         let bus_tx = write_tx.clone();
-        let bus_read_clone = Arc::clone(&bus_read);
-        let bus_write_clone = Arc::clone(&bus_write);
         let adapter_for_bus = Arc::clone(&adapter_arc);
         let last_output_for_bus = Arc::clone(&last_output_ms);
         let idle_threshold = adapter_arc.idle_ms_before_inject();
+        let agent_name_for_bus = cfg.agent_name.clone();
+        let program_for_bus = cfg.program.clone();
+        let model_for_bus = cfg.model.clone();
+        let project_for_bus = cfg.project.clone();
         let bus_to_pty = tokio::spawn(async move {
+            // Outer reconnect loop. Each iteration: open a fresh socket
+            // connection, Register, run the inner Read{wait:true} loop
+            // until the connection breaks, then back off and try again.
+            // Only exits when the local push-write channel is gone (i.e.
+            // the rest of the runner is shutting down).
+            let mut backoff_ms: u64 = 250;
+            const MAX_BACKOFF_MS: u64 = 8000;
             loop {
-                let req = BusRequest::Read {
-                    wait: Some(true),
-                    timeout_secs: Some(300),
-                };
-                if let Err(e) = send_request(&bus_write_clone, &req).await {
-                    warn!("bus send failed: {}", e);
-                    break;
-                }
-                match recv_response(&bus_read_clone).await {
-                    Ok(BusResponse::Message { message }) => {
-                        // Phase 3: idle gating. If the adapter wants idle
-                        // detection, poll last_output_ms until the gap from
-                        // the most recent PTY output exceeds the threshold.
-                        // We cap the wait at 30s so a stuck agent can't
-                        // permanently block bus messages — if no idle window
-                        // appears, the message goes through anyway and the
-                        // user sees it interleave with running output.
-                        if idle_threshold > 0 {
-                            let max_wait = Duration::from_secs(30);
-                            let started = Instant::now();
-                            loop {
-                                let now_ms = process_start.elapsed().as_millis() as i64;
-                                let last_ms =
-                                    last_output_for_bus.load(Ordering::Relaxed);
-                                let idle_for = now_ms.saturating_sub(last_ms) as u64;
-                                if idle_for >= idle_threshold {
-                                    break;
-                                }
-                                if started.elapsed() >= max_wait {
-                                    debug!(
-                                        "idle wait exceeded {:?}; injecting anyway",
-                                        max_wait
-                                    );
-                                    break;
-                                }
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
-                        }
-
-                        let bytes = adapter_for_bus.format_message(&message);
-                        if bus_tx
-                            .send(PtyWrite::BusMessage(bytes))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Ok(BusResponse::Ok { data }) => {
-                        // wait=true returns Ok([]) only on daemon timeout
-                        // expiry — keep polling.
-                        if data.is_array()
-                            && data.as_array().map(|a| a.is_empty()).unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        // Empty/unexpected Ok — keep going.
-                        debug!("unexpected Ok response in bus loop: {:?}", data);
-                    }
-                    Ok(BusResponse::Error { message }) => {
-                        // "No messages (timeout)" is normal under wait — loop.
-                        if message.contains("timeout") {
-                            continue;
-                        }
-                        warn!("bus error: {}", message);
-                        // Brief backoff to avoid tight error loops.
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                // (1) (re)connect + register
+                let conn = open_and_register(
+                    &agent_name_for_bus,
+                    &program_for_bus,
+                    &model_for_bus,
+                    &project_for_bus,
+                )
+                .await;
+                let (read, write) = match conn {
+                    Ok(pair) => {
+                        backoff_ms = 250; // success — reset backoff
+                        info!("bus connection (re)established for '{}'", agent_name_for_bus);
+                        pair
                     }
                     Err(e) => {
-                        warn!("bus recv failed: {}", e);
-                        break;
+                        warn!(
+                            "bus reconnect failed: {} — retrying in {}ms",
+                            e, backoff_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
+                        continue;
+                    }
+                };
+
+                // (2) Inner Read{wait:true} loop. Returns Ok(()) only on
+                // shutdown (channel closed); any other exit means the
+                // bus connection died and we should reconnect.
+                let res = run_bus_loop(
+                    &read,
+                    &write,
+                    &bus_tx,
+                    &adapter_for_bus,
+                    &last_output_for_bus,
+                    process_start,
+                    idle_threshold,
+                )
+                .await;
+                match res {
+                    InnerExit::Shutdown => {
+                        debug!("bus loop shutdown requested");
+                        return;
+                    }
+                    InnerExit::ConnectionLost(reason) => {
+                        warn!(
+                            "bus connection lost ({}); will reconnect after {}ms",
+                            reason, backoff_ms
+                        );
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
                     }
                 }
             }
@@ -402,9 +399,11 @@ impl PtyRunner {
         winch_task.abort();
         let _ = writer_join.await;
 
-        // Send Close to bus daemon. Best effort.
-        let close = BusRequest::Close;
-        let _ = send_request(&bus_write, &close).await;
+        // No explicit Close to the daemon — the bus_to_pty task owns its
+        // own connection and dropping it triggers the daemon's
+        // disconnect handler, which marks the agent Disconnected and
+        // releases claims. Sending Close here would only race that
+        // cleanup; skipping it is cleaner.
 
         Ok(exit_code)
     }
@@ -413,6 +412,122 @@ impl PtyRunner {
 // ----------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------
+
+/// Reason an inner bus loop iteration exited.
+enum InnerExit {
+    /// The local PTY-write channel went away — runner is shutting down,
+    /// don't reconnect.
+    Shutdown,
+    /// The bus socket (or daemon) misbehaved — reconnect after backoff.
+    ConnectionLost(String),
+}
+
+/// Establish a fresh socket connection to the daemon and Register this
+/// agent. Returns the (read, write) halves wrapped in the same Arc<Mutex>
+/// types the inner loop expects.
+async fn open_and_register(
+    name: &str,
+    program: &str,
+    model: &str,
+    project: &str,
+) -> Result<(
+    Arc<Mutex<BufReader<tokio::net::unix::OwnedReadHalf>>>,
+    Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+)> {
+    let sock = socket_path()?;
+    let stream = UnixStream::connect(&sock)
+        .await
+        .with_context(|| format!("connect to agentbus daemon at {:?}", sock))?;
+    let (read_half, write_half) = stream.into_split();
+    let read = Arc::new(Mutex::new(BufReader::new(read_half)));
+    let write = Arc::new(Mutex::new(write_half));
+
+    let register = BusRequest::Register {
+        name: name.to_string(),
+        program: program.to_string(),
+        model: model.to_string(),
+        project: project.to_string(),
+    };
+    send_request(&write, &register).await?;
+    match recv_response(&read).await? {
+        BusResponse::Ok { .. } => Ok((read, write)),
+        BusResponse::Error { message } => Err(anyhow!("re-register failed: {}", message)),
+        BusResponse::Message { .. } => {
+            Err(anyhow!("unexpected message response during re-register"))
+        }
+    }
+}
+
+/// Run the Read{wait:true} loop until the connection breaks or the local
+/// write channel goes away. Same body as the original Phase 1-3 loop;
+/// extracted so the outer reconnect logic can call it repeatedly.
+#[allow(clippy::too_many_arguments)]
+async fn run_bus_loop(
+    bus_read: &Arc<Mutex<BufReader<tokio::net::unix::OwnedReadHalf>>>,
+    bus_write: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    bus_tx: &mpsc::Sender<PtyWrite>,
+    adapter: &Arc<dyn adapter::Adapter>,
+    last_output_ms: &Arc<AtomicI64>,
+    process_start: Instant,
+    idle_threshold: u64,
+) -> InnerExit {
+    loop {
+        let req = BusRequest::Read {
+            wait: Some(true),
+            timeout_secs: Some(300),
+        };
+        if let Err(e) = send_request(bus_write, &req).await {
+            return InnerExit::ConnectionLost(format!("send: {}", e));
+        }
+        match recv_response(bus_read).await {
+            Ok(BusResponse::Message { message }) => {
+                if idle_threshold > 0 {
+                    let max_wait = Duration::from_secs(30);
+                    let started = Instant::now();
+                    loop {
+                        let now_ms = process_start.elapsed().as_millis() as i64;
+                        let last_ms = last_output_ms.load(Ordering::Relaxed);
+                        let idle_for = now_ms.saturating_sub(last_ms) as u64;
+                        if idle_for >= idle_threshold {
+                            break;
+                        }
+                        if started.elapsed() >= max_wait {
+                            debug!(
+                                "idle wait exceeded {:?}; injecting anyway",
+                                max_wait
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+
+                let bytes = adapter.format_message(&message);
+                if bus_tx.send(PtyWrite::BusMessage(bytes)).await.is_err() {
+                    return InnerExit::Shutdown;
+                }
+            }
+            Ok(BusResponse::Ok { data }) => {
+                if data.is_array()
+                    && data.as_array().map(|a| a.is_empty()).unwrap_or(false)
+                {
+                    continue;
+                }
+                debug!("unexpected Ok response in bus loop: {:?}", data);
+            }
+            Ok(BusResponse::Error { message }) => {
+                if message.contains("timeout") {
+                    continue;
+                }
+                warn!("bus error: {}", message);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                return InnerExit::ConnectionLost(format!("recv: {}", e));
+            }
+        }
+    }
+}
 
 async fn send_request(
     write: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
