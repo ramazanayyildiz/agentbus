@@ -7,7 +7,7 @@ use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "agentbus")]
-#[command(about = "Agent message bus CLI", long_about = None)]
+#[command(version, about = "Agent message bus CLI", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
