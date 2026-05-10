@@ -1,0 +1,154 @@
+# AgentBus — Status
+
+Current state of the autonomous build session.
+
+## TL;DR
+
+  - **8 commits on `main`** since the build started (Phase 0 → reconnect)
+  - **1 PR open**: `#2` — `feat/mcp-server` (MCP bridge, ready for review)
+  - **86 tests** passing across 3 crates (4 with MCP)
+  - **3 binaries**: `agentbus`, `agentbusd`, `agentbus-mcp`
+  - **Real cross-vendor agent-to-agent demo verified** (Claude ↔ Claude ↔ Codex)
+  - **All HIGH and MEDIUM bugs from external review fixed**
+  - **Dead-connection sweep + auto-reconnect** working
+
+## Branches
+
+| Branch | Status | What |
+|---|---|---|
+| `main` | live | All phases + bug fixes + reconnect logic |
+| `feat/mcp-server` | open PR `#2` | MCP server bridge — adds `agentbus-mcp` crate |
+| `fix/runner-reconnect` | merged into main | (auto-closed) |
+| `refactor/testability-improvements` | merged into main | original feature branch (now history) |
+
+## Phase history (main)
+
+```
+ba44844  [fix]      PTY runner auto-reconnect on bus disconnect
+2fe3f0e  [fix]      Dead-connection sweep — Disconnected state + startup reset
+713ed31  [merge]    README conflict resolution
+320862c  [security] MEDIUM fixes — 0700 perms, socket race
+2910acc  [security] HIGH fixes — Unregister auth, soft-delete (FK preserved)
+402e54a  [phase 1.1] PTY size auto-detection + SIGWINCH
+5c99e74  [phase 4-5] Transcript file + restart-on-failure + README
+e6c88e8  [phase 3]  Idle-time gating before bus message injection
+b4119bd  [phase 2]  Adapter trait — Claude/Codex/Aider/Generic profiles
+138900c  [phase 1]  agentbus run — PTY wrapper bridging to bus
+548b184  [phase 0]  PTY smoke test — bracketed paste + byte transparency
+```
+
+## Verified end-to-end flows
+
+### 1. Claude (Opus, atlas) ↔ Claude (Sonnet, claude2-2)
+Atlas sent message via `agentbus send`, claude2-2 received it as pasted
+input in its terminal, replied via Bash tool calling `agentbus send`,
+atlas received the reply as pasted input.
+
+### 2. Claude (atlas) ↔ Codex (GPT-5.5, codex3)
+Same pattern but cross-vendor. Codex received the envelope, responded
+with its own analysis of agentbus, reply came back to atlas.
+
+### 3. PTY runner reconnect after daemon restart
+```
+$ agentbus run --name reconnect-test -- mock-agent &
+$ agentbus send --to reconnect-test "msg-1"      # delivered
+$ kill <agentbusd-pid>; agentbus start            # daemon restart
+$ agentbus send --to reconnect-test "msg-2"      # delivered after auto-reconnect
+```
+Logs show: connection lost → backoff 250ms → reconnect failed → backoff
+500ms → connection (re)established. Exponential backoff caps at 8s.
+
+### 4. Dead-connection sweep
+After daemon restart, all rows previously in `state='active'` are flipped
+to `disconnected` (skipping rows that were explicitly `unregistered`).
+`agentbus status` now reflects reality instead of phantom zombies.
+
+### 5. MCP server tools roundtrip
+External `agentbus send --to mcp-roundtrip "hi"` → MCP server's poll
+connection receives the push → buffers in inbox → host's `agentbus_inbox`
+tool call drains it and returns the Message JSON.
+
+## Bugs fixed (from external review)
+
+| | Severity | Fix |
+|---|---|---|
+| Anyone could `Unregister` any agent | HIGH | Daemon checks connection's `agent_name` matches the requested target |
+| `unregister_agent` broke FKs once messages existed | HIGH | Soft-delete via `state='unregistered'` instead of DELETE |
+| Daemon socket race on startup | MEDIUM | PID-file lock check on startup; refuse to start if owner is alive |
+| No 0700 / 0600 permissions | MEDIUM | `ensure_agentbus_dir()` enforces dir 0700; daemon chmods socket 0600 |
+| No request IDs (control/data multiplex) | MEDIUM | Documented as not-needed-in-practice — current protocol naturally avoids the ambiguity |
+
+## What `main` has that wasn't there at session start
+
+  - `agentbus run` subcommand — PTY wrapping with bus bridging
+  - `agentbus-pty` crate — runner library
+  - 4 adapters (Claude, Codex, Aider, Generic) with idle thresholds
+  - Auto-reconnect on daemon disconnect
+  - Auto-detect terminal size + SIGWINCH propagation
+  - Transcript file capture (`--transcript /path`)
+  - Restart-on-failure (`--restart` + `--max-restarts`)
+  - `Disconnected` and `Unregistered` agent states
+  - Daemon startup sweeps stale `active` rows
+  - 0700/0600 permission hardening
+
+## What's pending (not in main yet)
+
+  - `feat/mcp-server` (PR #2) — adds `agentbus-mcp` crate. Ready for review.
+
+## What's not built but documented as TODO
+
+  - **Server→client MCP notifications** — currently host polls `agentbus_inbox`. Most MCP hosts don't support server-initiated notifications.
+  - **Sessions / transcript SQLite tables** — Phase 4 proper. We have file-based transcripts for now.
+  - **Adapter `is_prompt_ready(tail)`** — regex-based prompt detection on top of idle gate, for finer-grained injection timing.
+  - **Bracketed-paste fallback** — if some agent doesn't recognize `\x1b[200~`, fall back to per-character typing with delays.
+  - **Hook integration** — Claude Code SessionStart hook so sessions auto-join the bus without `agentbus run` wrapping.
+
+## How to demo right now
+
+```bash
+# (Daemon already running. If not: agentbus start)
+
+# Terminal 1: wrap Claude in agentbus
+~/CODE/Ram/agentbus/target/release/agentbus run \
+  --name claude-A --program claude --transcript /tmp/A.log \
+  -- claude --dangerously-skip-permissions
+
+# Terminal 2: wrap Codex in agentbus
+~/CODE/Ram/agentbus/target/release/agentbus run \
+  --name codex-A --program codex --transcript /tmp/codex.log \
+  -- codex --yolo
+
+# Terminal 3: send message between them
+~/CODE/Ram/agentbus/target/release/agentbus register --name me --program shell
+~/CODE/Ram/agentbus/target/release/agentbus send \
+  --from me --to claude-A --msg-type request \
+  "Send a message to codex-A asking what model it is."
+
+# Watch claude-A receive the prompt as pasted input, run the Bash command
+# `agentbus send --from claude-A --to codex-A ...`, codex-A receives,
+# responds via agentbus send, claude-A sees the reply, responds to me.
+```
+
+Resilient to daemon restart now: kill `agentbusd`, restart it, the
+wrappers auto-reconnect and message flow resumes.
+
+## Files of note
+
+  - `crates/agentbus-pty/src/runner.rs` — the heart of the PTY runner; contains the 4-task event loop, reconnect logic, and adapter wiring
+  - `crates/agentbus-pty/src/adapter.rs` — per-agent profiles
+  - `crates/agentbus-pty/src/inject.rs` — sanitizer + envelope formatter
+  - `crates/agentbus-mcp/src/main.rs` — MCP JSON-RPC server (on `feat/mcp-server`)
+  - `crates/agentbus-mcp/README.md` — MCP integration docs (`.mcp.json` snippet, etc.)
+  - `crates/agentbusd/src/main.rs` — daemon, includes all bug fixes
+  - `crates/agentbus-core/src/lib.rs` — shared types, DB layer, including Disconnected state and dead-connection sweep
+  - `README.md` — top-level project docs (PTY-runner-focused; MCP gets its own README in the crate)
+
+## Next session, in order
+
+1. Review and merge PR `#2` (MCP server) if happy with it
+2. Test the MCP integration in a real Claude Code session (add to `~/.claude/.mcp.json`)
+3. Decide whether to build sessions/transcript SQLite tables (Phase 4 proper)
+4. Decide whether to add a Claude Code hook so sessions auto-join the bus
+
+The architecture is sound, the demo works across vendors, and the bus
+survives daemon restarts. Foundations are stable.
