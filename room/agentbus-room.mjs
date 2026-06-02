@@ -413,8 +413,8 @@ function renderBubble(author, color, time, body, suffix = "") {
     .map((l) => `  ${l}`)
     .join("\n");
   writeOut(
-    `\n${rule}\n` +
-      `${color}${C.BOLD}▌ ${author}${C.RESET}${suffix} ${C.DIM}· ${time}${C.RESET}\n` +
+    `\n\n${rule}\n` +
+      `${color}${C.BOLD}▌ ${author}${C.RESET}${suffix}  ${C.DIM}· ${time}${C.RESET}\n` +
       `${indented}\n`
   );
 }
