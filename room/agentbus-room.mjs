@@ -380,6 +380,23 @@ function appendLog(roomId, line) {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
+// Shared "chat bubble" renderer. A dim horizontal rule + a colored author bar
+// (▌ name · time) + a 2-space-indented body. The rule + indent give clear visual
+// separation between consecutive messages so multi-line replies don't blur together.
+function renderBubble(author, color, time, body, suffix = "") {
+  const rule = `${C.DIM}${"─".repeat(58)}${C.RESET}`;
+  const indented = String(body ?? "")
+    .replace(/[ \t\r\n]+$/, "")
+    .split("\n")
+    .map((l) => `  ${l}`)
+    .join("\n");
+  process.stdout.write(
+    `\n${rule}\n` +
+      `${color}${C.BOLD}▌ ${author}${C.RESET}${suffix} ${C.DIM}· ${time}${C.RESET}\n` +
+      `${indented}\n`
+  );
+}
+
 function renderMessage(msg, roomId) {
   const time = new Date(msg.created_at || Date.now()).toLocaleTimeString([], {
     hour: "2-digit",
@@ -389,15 +406,8 @@ function renderMessage(msg, roomId) {
   // (A) DB-tail rows carry the busId in from_agent; strip "<roomId>-" for display.
   // roomBus rows are already filtered out by dbTailMessages, so this only sees agents.
   const author = displayName(msg.from_agent || msg.from || "?", roomId);
-  const color = agentColor(author);
-  const tag = `${C.DIM}${time}${C.RESET} ${color}${C.BOLD}[${author}]${C.RESET}`;
-  const body = msg.body || "";
-
-  // Print with blank line separator
-  process.stdout.write(`\n${tag}\n${body}\n`);
-
-  // Log to file
-  appendLog(roomId, `[${time}] [${author}] ${body}`);
+  renderBubble(author, agentColor(author), time, msg.body || "");
+  appendLog(roomId, `[${time}] [${author}] ${msg.body || ""}`);
 }
 
 function printSystemMsg(text) {
@@ -1106,13 +1116,10 @@ class RoomHub {
       const wasPaused = this.cb.isPaused();
       this.cb.recordHumanMessage();
 
-      // Echo human message locally (not in DB tail since it's from=room)
+      // Echo human message locally (not in DB tail since it's from=room) — same bubble style.
       const time = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-      process.stdout.write(`\n${C.DIM}${time}${C.RESET} ${C.GREEN}${C.BOLD}[ram]${C.RESET}`);
-      if (targetOverride) {
-        process.stdout.write(`${C.DIM} → @${targetOverride}${C.RESET}`);
-      }
-      process.stdout.write(`\n${body}\n`);
+      const suffix = targetOverride ? ` ${C.DIM}→ @${targetOverride}${C.RESET}` : "";
+      renderBubble("ram", C.GREEN, time, body, suffix);
       appendLog(this.roomId, `[${time}] [ram] ${body}`);
 
       // M4: if the circuit-breaker was paused, flush buffered messages first,
