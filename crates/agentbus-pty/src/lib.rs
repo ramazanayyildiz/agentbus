@@ -14,8 +14,10 @@
 pub mod adapter;
 pub mod inject;
 pub mod runner;
+pub mod strip;
 
 pub use adapter::{
     Adapter, AiderAdapter, ClaudeAdapter, CodexAdapter, GenericAdapter, OpencodeAdapter,
 };
 pub use runner::PtyRunner;
+pub use strip::{strip_ansi_preserve_box, strip_tui_chrome};

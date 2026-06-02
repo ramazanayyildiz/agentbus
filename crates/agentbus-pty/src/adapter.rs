@@ -17,6 +17,7 @@
 use agentbus_core::Message;
 
 use crate::inject;
+use crate::strip;
 
 /// Trait for per-agent injection behavior.
 ///
@@ -40,6 +41,24 @@ pub trait Adapter: Send + Sync {
     /// as it arrives. Phase 1/2 behavior.
     fn idle_ms_before_inject(&self) -> u64 {
         0
+    }
+
+    /// Is the agent's input prompt visible / ready at the bottom of the
+    /// screen?
+    ///
+    /// `screen_tail` is the last ~N lines of the rendered PTY output with ANSI
+    /// escapes stripped but box-drawing / prompt glyphs preserved (see
+    /// `crate::strip::strip_ansi_preserve_box`). This is a layered improvement
+    /// on top of the idle gate: the runner injects only when BOTH the idle
+    /// gate is satisfied AND this returns true (with a hard 30s safety cap so a
+    /// never-ready agent still eventually injects — see `runner.rs`).
+    ///
+    /// Conservative default: `true`. An adapter with no reliable prompt
+    /// pattern falls back to the pure idle gate, exactly matching pre-Phase-3
+    /// behavior. Ported per-agent from coder/agentapi's
+    /// `lib/msgfmt/agent_readiness.go` + `lib/msgfmt/message_box.go`.
+    fn is_prompt_ready(&self, _screen_tail: &str) -> bool {
+        true
     }
 }
 
@@ -86,6 +105,15 @@ impl Adapter for ClaudeAdapter {
     fn idle_ms_before_inject(&self) -> u64 {
         750
     }
+
+    /// Claude shows a `>` / `❯` prompt (optionally inside a `─────` box) at the
+    /// bottom once it's ready for input. Ported from agentapi's
+    /// `findGreaterThanMessageBox` + `findGenericSlimMessageBox`
+    /// (lib/msgfmt/message_box.go), used for AgentTypeClaude in
+    /// agent_readiness.go.
+    fn is_prompt_ready(&self, screen_tail: &str) -> bool {
+        strip::has_greater_than_or_slim_box(screen_tail)
+    }
 }
 
 /// Codex adapter. Behavior identical to Claude's for now (same input model:
@@ -104,6 +132,13 @@ impl Adapter for CodexAdapter {
 
     fn idle_ms_before_inject(&self) -> u64 {
         750
+    }
+
+    /// Codex shows a `›` prompt marker near the bottom when ready. Ported from
+    /// agentapi's `removeCodexMessageBox` (lib/msgfmt/message_box.go), used for
+    /// AgentTypeCodex in agent_readiness.go.
+    fn is_prompt_ready(&self, screen_tail: &str) -> bool {
+        strip::has_codex_box(screen_tail)
     }
 }
 
@@ -124,6 +159,14 @@ impl Adapter for OpencodeAdapter {
 
     fn idle_ms_before_inject(&self) -> u64 {
         750
+    }
+
+    /// opencode renders a `╹▀▀▀▀…` footer (and a `❯` prompt) once its TUI is
+    /// interactive. Ported from agentapi's `removeOpencodeMessageBox`
+    /// (lib/msgfmt/message_box.go), used for AgentTypeOpencode in
+    /// agent_readiness.go.
+    fn is_prompt_ready(&self, screen_tail: &str) -> bool {
+        strip::has_opencode_box(screen_tail)
     }
 }
 
@@ -279,5 +322,78 @@ mod tests {
         assert_eq!(AiderAdapter.idle_ms_before_inject(), 500);
         // Generic fallback: no gating, behave like Phase 1/2.
         assert_eq!(GenericAdapter.idle_ms_before_inject(), 0);
+    }
+
+    // --- is_prompt_ready (Phase 3 readiness detection) -------------------
+
+    /// Realistic Claude input-box screen: a settled prompt at the bottom.
+    const CLAUDE_READY: &str = "\
+● I've finished the refactor.
+
+────────────────────────────────────────
+ >
+────────────────────────────────────────
+  ? for shortcuts";
+
+    /// Realistic Codex screen with its `›` prompt marker near the bottom.
+    const CODEX_READY: &str = "\
+codex ran tests, all green.
+
+›
+  send a message";
+
+    /// Mid-spinner "thinking" screen — agent is busy, NOT ready.
+    const THINKING: &str = "\
+✻ Crunching the request…
+  streaming tokens here
+  still working on it";
+
+    #[test]
+    fn claude_prompt_ready_detects_input_box() {
+        assert!(ClaudeAdapter.is_prompt_ready(CLAUDE_READY));
+    }
+
+    #[test]
+    fn claude_prompt_not_ready_mid_spinner() {
+        assert!(!ClaudeAdapter.is_prompt_ready(THINKING));
+    }
+
+    #[test]
+    fn claude_not_ready_on_streamed_redirect() {
+        // A `>` inside streamed output (shell redirect) must NOT be read as a
+        // ready prompt — the hardened, recurring-gate behavior.
+        let screen = "running shell command\n  $ cat > /tmp/out.txt\nwriting output";
+        assert!(!ClaudeAdapter.is_prompt_ready(screen));
+    }
+
+    #[test]
+    fn codex_prompt_ready_detects_box() {
+        assert!(CodexAdapter.is_prompt_ready(CODEX_READY));
+    }
+
+    #[test]
+    fn codex_prompt_not_ready_mid_spinner() {
+        assert!(!CodexAdapter.is_prompt_ready(THINKING));
+    }
+
+    #[test]
+    fn opencode_prompt_ready_detects_footer() {
+        let screen = "┃  Build  Anthropic Claude Sonnet 4\n\
+            ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+            tab switch agent  ctrl+p commands";
+        assert!(OpencodeAdapter.is_prompt_ready(screen));
+    }
+
+    #[test]
+    fn opencode_prompt_not_ready_mid_spinner() {
+        assert!(!OpencodeAdapter.is_prompt_ready(THINKING));
+    }
+
+    #[test]
+    fn generic_and_aider_default_ready_true() {
+        // Conservative default: no pattern -> always ready -> pure idle gate.
+        assert!(GenericAdapter.is_prompt_ready(THINKING));
+        assert!(AiderAdapter.is_prompt_ready(THINKING));
+        assert!(GenericAdapter.is_prompt_ready(""));
     }
 }

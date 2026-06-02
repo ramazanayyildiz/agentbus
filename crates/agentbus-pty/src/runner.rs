@@ -47,6 +47,12 @@ pub struct PtyRunnerConfig {
 /// Top-level entry point.
 pub struct PtyRunner;
 
+/// How many trailing raw PTY bytes to retain for prompt-readiness detection.
+/// ~8KB comfortably holds the last screenful of a TUI (the bottom input box
+/// is what readiness keys on) without unbounded growth. Advised by agentapi's
+/// screen-tracker approach, which inspects only the rendered screen tail.
+const SCREEN_TAIL_BYTES: usize = 8 * 1024;
+
 /// Bytes destined for the PTY master, with a tag so the serializer can log
 /// what it's writing. Using an enum (not just `Vec<u8>`) lets us add per-
 /// source policy later (e.g. rate limit bus injections).
@@ -161,6 +167,19 @@ impl PtyRunner {
         let process_start = Instant::now();
         let last_output_ms = Arc::new(AtomicI64::new(0));
 
+        // Shared rolling tail of the most recent raw PTY bytes (Phase 3
+        // readiness detection). Task C appends every read and truncates to
+        // SCREEN_TAIL_BYTES; the bus loop locks it briefly, copies, strips
+        // ANSI (preserving box-drawing glyphs), and asks the adapter whether
+        // the agent's prompt is visible. A std Mutex (not tokio) is correct:
+        // Task C is a blocking thread and neither critical section holds an
+        // `.await`. This is an *approximation* of agentapi's VT-rendered
+        // screen — acceptable because the gate only ever delays injection and
+        // the 30s cap guarantees forward progress.
+        let screen_tail = Arc::new(std::sync::Mutex::new(Vec::<u8>::with_capacity(
+            SCREEN_TAIL_BYTES,
+        )));
+
         // ---- 5. Spawn worker tasks -----------------------------------------
         // (a) PTY writer serializer — only ever one writer to the PTY master
         let mut pty_writer_task = pty_writer;
@@ -196,6 +215,7 @@ impl PtyRunner {
         //   - if a transcript path was configured, append every byte to it
         //     for replay / debugging (Phase 4 lite — file-backed, no DB)
         let last_output_for_reader = Arc::clone(&last_output_ms);
+        let screen_tail_for_reader = Arc::clone(&screen_tail);
         let transcript_path = cfg.transcript_path.clone();
         let pty_to_stdout = tokio::task::spawn_blocking(move || -> Result<()> {
             let mut reader = pty_reader;
@@ -222,6 +242,17 @@ impl PtyRunner {
                     Ok(n) => {
                         let now_ms = process_start.elapsed().as_millis() as i64;
                         last_output_for_reader.store(now_ms, Ordering::Relaxed);
+                        // Maintain the rolling screen tail for readiness
+                        // detection. Append, then trim from the front so we
+                        // keep only the last SCREEN_TAIL_BYTES. Short critical
+                        // section, no .await — std Mutex is correct here.
+                        if let Ok(mut tail) = screen_tail_for_reader.lock() {
+                            tail.extend_from_slice(&buf[..n]);
+                            if tail.len() > SCREEN_TAIL_BYTES {
+                                let drop = tail.len() - SCREEN_TAIL_BYTES;
+                                tail.drain(..drop);
+                            }
+                        }
                         if stdout.write_all(&buf[..n]).is_err() {
                             break;
                         }
@@ -268,6 +299,7 @@ impl PtyRunner {
         let bus_tx = write_tx.clone();
         let adapter_for_bus = Arc::clone(&adapter_arc);
         let last_output_for_bus = Arc::clone(&last_output_ms);
+        let screen_tail_for_bus = Arc::clone(&screen_tail);
         let idle_threshold = adapter_arc.idle_ms_before_inject();
         let agent_name_for_bus = cfg.agent_name.clone();
         let program_for_bus = cfg.program.clone();
@@ -293,11 +325,11 @@ impl PtyRunner {
                 let (read, write) = match conn {
                     Ok(pair) => {
                         backoff_ms = 250; // success — reset backoff
-                        info!("bus connection (re)established for '{}'", agent_name_for_bus);
+                        debug!("bus connection (re)established for '{}'", agent_name_for_bus);
                         pair
                     }
                     Err(e) => {
-                        warn!(
+                        debug!(
                             "bus reconnect failed: {} — retrying in {}ms",
                             e, backoff_ms
                         );
@@ -316,6 +348,7 @@ impl PtyRunner {
                     &bus_tx,
                     &adapter_for_bus,
                     &last_output_for_bus,
+                    &screen_tail_for_bus,
                     process_start,
                     idle_threshold,
                 )
@@ -326,7 +359,7 @@ impl PtyRunner {
                         return;
                     }
                     InnerExit::ConnectionLost(reason) => {
-                        warn!(
+                        debug!(
                             "bus connection lost ({}); will reconnect after {}ms",
                             reason, backoff_ms
                         );
@@ -468,6 +501,7 @@ async fn run_bus_loop(
     bus_tx: &mpsc::Sender<PtyWrite>,
     adapter: &Arc<dyn adapter::Adapter>,
     last_output_ms: &Arc<AtomicI64>,
+    screen_tail: &Arc<std::sync::Mutex<Vec<u8>>>,
     process_start: Instant,
     idle_threshold: u64,
 ) -> InnerExit {
@@ -485,6 +519,20 @@ async fn run_bus_loop(
         }
         match recv_response(bus_read).await {
             Ok(BusResponse::Message { message }) => {
+                // Pre-inject gate. Two layered conditions, ONE wait loop, ONE
+                // 30s safety cap:
+                //   (1) idle gate  — PTY output has been quiet for at least
+                //       `idle_threshold` ms (the agent isn't actively
+                //       producing output right now).
+                //   (2) prompt-ready gate — the adapter sees its input box /
+                //       prompt at the bottom of the rendered screen tail
+                //       (Phase 3, ported from agentapi agent_readiness.go).
+                //
+                // We inject only when BOTH hold. The 30s cap guarantees a
+                // never-ready agent still eventually injects (no deadlock).
+                //
+                // When `idle_threshold == 0` (GenericAdapter) we skip the
+                // whole block — behavior is byte-identical to Phase 1/2.
                 if idle_threshold > 0 {
                     let max_wait = Duration::from_secs(30);
                     let started = Instant::now();
@@ -492,12 +540,29 @@ async fn run_bus_loop(
                         let now_ms = process_start.elapsed().as_millis() as i64;
                         let last_ms = last_output_ms.load(Ordering::Relaxed);
                         let idle_for = now_ms.saturating_sub(last_ms) as u64;
+
                         if idle_for >= idle_threshold {
-                            break;
+                            // Idle gate satisfied — now check prompt readiness.
+                            // Copy + strip ANSI (preserving box glyphs) so the
+                            // adapter sees an approximation of the rendered
+                            // screen tail.
+                            let ready = {
+                                let raw = screen_tail
+                                    .lock()
+                                    .map(|t| String::from_utf8_lossy(&t).into_owned())
+                                    .unwrap_or_default();
+                                let tail = crate::strip::strip_ansi_preserve_box(&raw);
+                                adapter.is_prompt_ready(&tail)
+                            };
+                            if ready {
+                                break;
+                            }
+                            // Idle but prompt not yet visible (e.g. still in
+                            // boot churn): keep waiting until ready or cap.
                         }
                         if started.elapsed() >= max_wait {
                             debug!(
-                                "idle wait exceeded {:?}; injecting anyway",
+                                "idle+ready wait exceeded {:?}; injecting anyway",
                                 max_wait
                             );
                             break;

@@ -25,6 +25,7 @@ anyhow = "1"
 thiserror = "1"
 portable-pty = "0.8"
 libc = "0.2"
+regex = "1"
 
 # The profile that 'dist' will build with
 [profile.dist]
