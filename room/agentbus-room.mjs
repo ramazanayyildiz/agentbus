@@ -19,6 +19,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import readline from "node:readline";
 import { execFileSync, execFile, spawnSync, spawn } from "node:child_process";
 
@@ -63,13 +64,20 @@ const C = {
   BRBLUE:    "\x1b[94m",
 };
 
+// Subtle background for ram's own message body block. The user's terminal theme is
+// light/cream, so a light-gray (256-color 253) reads as "a bit darker than the cream".
+// Kept as one named const so the shade is trivial to retune later.
+const RAM_BG = "\x1b[48;5;253m";
+// Width the ram body block is padded to so the background fills a clean rectangle.
+const RAM_BG_WIDTH = 62;
+
 /** Deterministic color assignment for agent names. GREEN is reserved for the human (ram). */
 const AGENT_COLORS = [C.CYAN, C.YELLOW, C.MAGENTA, C.BLUE, C.BRCYAN, C.BRYELLOW, C.BRMAGENTA, C.BRBLUE];
 const colorCache = new Map();
 let colorIdx = 0;
 
 function agentColor(name) {
-  if (name === "ram") return C.BRGREEN; // human stands out in bright green (reserved)
+  if (name === "ram") return C.GREEN; // human's name stays normal green (body gets RAM_BG instead)
   // The hub's bus identity is namespaced per room ("room-<roomId>"), but the
   // human-facing label stays "room". Match both so the namespaced sender renders dim.
   if (name === "room" || name.startsWith("room-")) return C.DIM;
@@ -207,6 +215,23 @@ function completeMention(line, members) {
   return { matches, replacement: `@${m[1]}` };
 }
 
+// ── Paste Coalescing (FIX #5, pure core) ──────────────────────────────────────
+
+/**
+ * Milliseconds to wait for another 'line' event before treating the buffer as a
+ * complete input. A multi-line PASTE fires a burst of 'line' events within a few ms;
+ * a human typing fires one 'line' then a long pause. 20ms cleanly separates them.
+ */
+const PASTE_COALESCE_MS = 20;
+
+/**
+ * Join a buffer of coalesced 'line' events into ONE message body, preserving the
+ * pasted multi-line structure. A single typed line → the line unchanged. Pure.
+ */
+function coalesceLines(lines) {
+  return lines.join("\n");
+}
+
 // ── Agent Spec Parsing (per-program launch) ───────────────────────────────────
 
 /** Programs the hub knows how to launch. */
@@ -238,15 +263,89 @@ function parseAgentSpec(spec) {
 
 /**
  * Build the exact config.toml contents for an isolated Codex agent.
- * Pre-trusts WORKDIR (no folder-trust modal) and omits [mcp_servers.*] to
+ * Pre-trusts the given directory (no folder-trust modal) and omits [mcp_servers.*] to
  * avoid the heavy MCP boot stall. Pure function — testable.
+ * FIX #4: the trusted dir is now the USER'S launchDir (where codex runs via --cd),
+ * not a throwaway tmp workdir — so the agent can see and work in the real project.
  */
-function buildCodexConfigToml(workDir) {
+function buildCodexConfigToml(trustedDir) {
   return (
     `model = "gpt-5.5"\n` +
     `model_reasoning_effort = "low"\n` +
-    `[projects."${workDir}"]\n` +
+    `[projects."${trustedDir}"]\n` +
     `trust_level = "trusted"\n`
+  );
+}
+
+// ── Resume / State Persistence (pure path + (de)serialize helpers) ────────────
+
+/**
+ * Path to the per-room state file: <agentbusDir>/rooms/<roomId>.json
+ * Honors AGENTBUS_DIR via agentbusDir(). Pure (derives from env+args only).
+ */
+function stateFilePathFor(roomId) {
+  return path.join(agentbusDir(), "rooms", `${roomId}.json`);
+}
+
+/**
+ * Stable per-(roomId, name) CODEX_HOME, persisted across runs so `codex resume`
+ * can find the prior session. Lives under <agentbusDir>/rooms/<roomId>/codex-<name>/
+ * (NOT tmp — tmp is wiped by the OS and by old cleanup logic). Pure.
+ */
+function codexHomeFor(roomId, name) {
+  return path.join(agentbusDir(), "rooms", roomId, `codex-${name}`);
+}
+
+/**
+ * Serialize hub state to the on-disk JSON shape. Pure — testable round-trip.
+ * agents[] carries each member's program + (program-specific) resume handle:
+ *   codex → codexHome path; claude → claudeSessionId (uuid). Either may be absent.
+ */
+function serializeState(roomId, members, programs, resumeInfo) {
+  return {
+    roomId,
+    updatedAt: new Date().toISOString(),
+    agents: members.map((name) => {
+      const a = { name, program: programs[name] || "claude" };
+      const info = resumeInfo[name] || {};
+      if (info.codexHome) a.codexHome = info.codexHome;
+      if (info.claudeSessionId) a.claudeSessionId = info.claudeSessionId;
+      return a;
+    }),
+  };
+}
+
+/**
+ * Parse a state-file object back into { roomId, agents } with defensive defaults.
+ * Pure — accepts the parsed JSON, returns null if the shape is unusable.
+ */
+function deserializeState(obj) {
+  if (!obj || typeof obj !== "object" || !Array.isArray(obj.agents)) return null;
+  const agents = obj.agents
+    .filter((a) => a && typeof a.name === "string" && AGENT_NAME_RE.test(a.name))
+    .map((a) => ({
+      name: a.name,
+      program: VALID_PROGRAMS.includes(a.program) ? a.program : "claude",
+      codexHome: typeof a.codexHome === "string" ? a.codexHome : undefined,
+      claudeSessionId: typeof a.claudeSessionId === "string" ? a.claudeSessionId : undefined,
+    }));
+  return { roomId: obj.roomId, agents };
+}
+
+/**
+ * Build the SQL that replays the prior thread on --resume: the last `limit` rows
+ * for this room, excluding the hub's relay copies (from_agent = roomBus). We select
+ * DESC+LIMIT to cap at the TAIL, then the caller reverses to chronological order.
+ * Pure — returns the SQL string (roomId/roomBus single-quote-escaped, limit coerced int).
+ */
+function buildReplaySql(roomId, roomBus, limit) {
+  const escapedRoomId = String(roomId).replace(/'/g, "''");
+  const escapedRoomBus = String(roomBus).replace(/'/g, "''");
+  return (
+    `SELECT rowid, id, from_agent, to_agent, thread_id, msg_type, body, created_at ` +
+    `FROM messages ` +
+    `WHERE thread_id = '${escapedRoomId}' AND from_agent != '${escapedRoomBus}' ` +
+    `ORDER BY rowid DESC LIMIT ${Number(limit) || 0};`
   );
 }
 
@@ -413,11 +512,20 @@ function writeOut(text) {
 
 function renderBubble(author, color, time, body, suffix = "") {
   const rule = `${C.DIM}${"─".repeat(58)}${C.RESET}`;
-  const indented = String(body ?? "")
+  const lines = String(body ?? "")
     .replace(/[ \t\r\n]+$/, "")
-    .split("\n")
-    .map((l) => `  ${l}`)
-    .join("\n");
+    .split("\n");
+  // ram's own body renders as a subtle darker block (light-gray bg) so it stands out
+  // without coloring the text bright green. The rule + header stay un-backgrounded.
+  const indented = author === "ram"
+    ? lines
+        .map((l) => {
+          const text = `  ${l}`;
+          const pad = " ".repeat(Math.max(0, RAM_BG_WIDTH - text.length));
+          return `${RAM_BG}${text}${pad}${C.RESET}`;
+        })
+        .join("\n")
+    : lines.map((l) => `  ${l}`).join("\n");
   writeOut(
     `\n\n${rule}\n` +
       `${color}${C.BOLD}▌ ${author}${C.RESET}${suffix}  ${C.DIM}· ${time}${C.RESET}\n` +
@@ -542,13 +650,18 @@ function spawnRunner(agentName, args, launchDir, extraEnv) {
 }
 
 /**
- * Launch a CLAUDE agent with agentbus run. (Behavior unchanged from the original
- * single-program launcher — kept byte-for-byte.)
- * Returns { child, spFile, transcriptFile, emptyMcp }.
+ * Launch a CLAUDE agent with agentbus run.
+ * Returns { child, spFile, transcriptFile, emptyMcp, claudeSessionId }.
  *
  * H3: emptyMcp path is returned so shutdown can unlink it (was leaked previously).
+ *
+ * FEATURE #1 (session capture, robust path): instead of racing to find the newest
+ * *.jsonl under ~/.claude/projects/<cwd-hash>/ (which collides with other concurrent
+ * Claude sessions in the same cwd), we PRE-ASSIGN a UUID via `claude --session-id <uuid>`
+ * on fresh launch and store it. On --resume we relaunch `claude --resume <uuid>`.
+ * `resumeSessionId` (when set) takes precedence and is passed to --resume.
  */
-function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
+function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId = null } = {}) {
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
   const spFile = path.join(os.tmpdir(), `room-sp-${agentName}-${roomId}.txt`);
   fs.writeFileSync(spFile, prompt);
@@ -560,8 +673,14 @@ function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDi
   // and the agent exits 1 at launch.
   if (!fs.existsSync(emptyMcp)) fs.writeFileSync(emptyMcp, '{"mcpServers":{}}');
 
+  // FEATURE #1: resume → reuse the stored id; fresh → mint a new one we control.
+  const claudeSessionId = resumeSessionId || crypto.randomUUID();
+
   // (A) Register on the bus under the namespaced busId, not the raw display name.
   const busId = agentBusId(roomId, agentName);
+  const sessionArgs = resumeSessionId
+    ? ["--resume", claudeSessionId]      // restore the prior conversation
+    : ["--session-id", claudeSessionId]; // pin a known id so we can resume it later
   const args = [
     "run",
     "--name", busId,
@@ -573,91 +692,108 @@ function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDi
     "--strict-mcp-config",
     "--mcp-config", emptyMcp,
     "--append-system-prompt-file", spFile,
+    ...sessionArgs,
   ];
 
-  printSystemMsg(`Launching claude agent ${agentName} in ${launchDir}...`);
+  printSystemMsg(`Launching claude agent ${agentName} in ${launchDir}${resumeSessionId ? ` (resuming ${claudeSessionId})` : ""}...`);
 
   const child = spawnRunner(agentName, args, launchDir, null);
 
   // Note: the 'exit' + member-pruning handler is attached in launchAgents() where 'this' is bound (M3).
-  return { child, spFile, transcriptFile, emptyMcp };
+  return { child, spFile, transcriptFile, emptyMcp, claudeSessionId };
 }
 
 /**
  * Launch a CODEX agent with agentbus run.
- * Returns { child, transcriptFile, codexHome, workDir } (plus spFile/emptyMcp = null
+ * Returns { child, transcriptFile, codexHome } (plus spFile/emptyMcp = null
  * so the children-entry shape stays uniform for shutdown).
  *
- * Isolation recipe (validated live):
- *  - Per-agent CODEX_HOME in tmpdir. Symlink auth-providing files from the real
- *    ~/.codex (auth.json, accounts, version.json, models_cache.json), each guarded.
- *  - config.toml pre-trusts a per-agent WORKDIR (no folder-trust modal) and omits
- *    [mcp_servers.*] (avoids the heavy MCP boot stall).
- *  - AGENTS.md in WORKDIR carries the SAME room system prompt Claude gets — the
- *    trust layer — just delivered as a file instead of --append-system-prompt-file.
+ * Isolation recipe:
+ *  - STABLE per-(roomId, name) CODEX_HOME under <agentbusDir>/rooms/<roomId>/codex-<name>/
+ *    (FEATURE #1: NOT tmp, so codex sessions persist across runs for `codex resume`).
+ *    Symlink auth-providing files from the real ~/.codex (auth.json, accounts,
+ *    version.json, models_cache.json), each guarded. Existing home is REUSED, never
+ *    rm'd at launch (rm would wipe the resumable session) — only /kick deletes it.
+ *  - config.toml pre-trusts the USER'S launchDir (FIX #4 — no folder-trust modal for
+ *    the real project) and omits [mcp_servers.*] (avoids the heavy MCP boot stall).
+ *  - AGENTS.md in CODEX_HOME (FIX #4 — codex reads $CODEX_HOME/AGENTS.md as GLOBAL
+ *    instructions, same as ~/.codex/AGENTS.md) carries the SAME room system prompt
+ *    Claude gets, so we deliver the trust layer WITHOUT polluting the user's repo.
+ *  - codex runs with `--cd launchDir` (FIX #4) so it works in the user's actual project.
+ *    `resume:true` (FEATURE #1) relaunches the prior session via `codex resume --last --all`.
  */
-function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
+function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false } = {}) {
   const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
-  const codexHome = path.join(os.tmpdir(), `codex-home-${roomId}-${agentName}`);
-  const workDir = path.join(os.tmpdir(), `codex-work-${roomId}-${agentName}`);
+  const codexHome = codexHomeFor(roomId, agentName);
 
-  // Stale dirs from a crashed prior run would make symlinkSync throw EEXIST — start clean.
-  try { fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+  // Ensure the stable home exists. Do NOT rm it — a prior run's session lives here and
+  // is what `codex resume` reads. (On a fresh first launch this just creates it.)
   fs.mkdirSync(codexHome, { recursive: true });
-  fs.mkdirSync(workDir, { recursive: true });
 
   // Symlink auth-providing files from the real ~/.codex into the isolated home.
+  // Guarded per-entry; symlinkSync throws EEXIST if the home is being reused, which is fine.
   const realCodexHome = path.join(os.homedir(), ".codex");
   for (const entry of ["auth.json", "accounts", "version.json", "models_cache.json"]) {
     const src = path.join(realCodexHome, entry);
     const dst = path.join(codexHome, entry);
     try {
-      if (fs.existsSync(src)) fs.symlinkSync(src, dst);
+      if (fs.existsSync(src) && !fs.existsSync(dst)) fs.symlinkSync(src, dst);
     } catch {
       // non-fatal: missing/unsymlinkable entry just means that capability is absent
     }
   }
 
-  // config.toml: model + pre-trusted workdir, no MCP servers.
-  fs.writeFileSync(path.join(codexHome, "config.toml"), buildCodexConfigToml(workDir));
+  // config.toml: model + pre-trusted launchDir (FIX #4), no MCP servers. Rewritten each
+  // launch (cheap, idempotent) so a moved launchDir re-trusts correctly.
+  fs.writeFileSync(path.join(codexHome, "config.toml"), buildCodexConfigToml(launchDir));
 
-  // AGENTS.md: reuse the EXACT same room system prompt Claude receives, so both
-  // agents behave consistently (same roster/trust framing/--to room reply convention).
+  // AGENTS.md in the HOME (FIX #4): global instructions reused on every codex invocation,
+  // including resume. Same room system prompt Claude gets — consistent roster/trust framing.
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
-  fs.writeFileSync(path.join(workDir, "AGENTS.md"), prompt);
+  fs.writeFileSync(path.join(codexHome, "AGENTS.md"), prompt);
 
   // (A) Register on the bus under the namespaced busId, not the raw display name.
   const busId = agentBusId(roomId, agentName);
+  // FEATURE #1: on --resume, continue the most recent session in this home.
+  // `resume --last --all` — --all disables codex's cwd filtering (the per-agent home is
+  // already isolated to one agent, so the cwd filter only risks hiding the session).
+  const codexArgs = resume
+    ? ["codex", "resume", "--last", "--all",
+       "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+       "--cd", launchDir]
+    : ["codex",
+       "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+       "--cd", launchDir];
   const args = [
     "run",
     "--name", busId,
     "--program", "codex",
     "--transcript", transcriptFile,
     "--",
-    "codex",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--dangerously-bypass-hook-trust",
-    "--cd", workDir,
+    ...codexArgs,
   ];
 
-  printSystemMsg(`Launching codex agent ${agentName} in ${workDir} (CODEX_HOME=${codexHome})...`);
+  printSystemMsg(`Launching codex agent ${agentName} in ${launchDir} (CODEX_HOME=${codexHome}${resume ? ", resuming" : ""})...`);
 
   const child = spawnRunner(agentName, args, launchDir, { CODEX_HOME: codexHome });
 
-  // spFile/emptyMcp are null for codex; codexHome/workDir drive its teardown instead.
-  return { child, transcriptFile, spFile: null, emptyMcp: null, codexHome, workDir };
+  // spFile/emptyMcp are null for codex; codexHome drives its teardown instead.
+  // claudeSessionId is null (codex resumes via its home, not a session id).
+  return { child, transcriptFile, spFile: null, emptyMcp: null, codexHome, claudeSessionId: null };
 }
 
 /**
- * Per-program launch dispatcher. Claude path is unchanged; codex path is new.
- * Keeps launchAgents() agnostic of program-specific details.
+ * Per-program launch dispatcher. `resume` carries optional resume handles:
+ *   { codex: true }            → relaunch codex via `codex resume --last --all`
+ *   { claudeSessionId: <uuid> } → relaunch claude via `claude --resume <uuid>`
+ * Absent/empty → fresh launch. Keeps launchAgents() agnostic of program details.
  */
-function launchAgent(agentName, program, allAgents, roomId, launchDir, transcriptDir) {
+function launchAgent(agentName, program, allAgents, roomId, launchDir, transcriptDir, resume = {}) {
   if (program === "codex") {
-    return launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir);
+    return launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.codex });
   }
   // default + 'claude'
-  return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir);
+  return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId: resume.claudeSessionId || null });
 }
 
 /**
@@ -811,6 +947,42 @@ class RoomHub {
     this.pausedMessages = []; // M4: buffer messages suppressed by circuit-breaker for flush on /resume
     this.working = new Set(); // (C) agents we relayed to but haven't heard back from — drives "is working…"
     this.launchDir = process.cwd(); // (B) where agents are launched; set for real in run(), reused by /add
+    // FEATURE #1: per-agent resume handles, persisted to the state file.
+    //   resumeInfo[name] = { codexHome?, claudeSessionId? }
+    this.resumeInfo = {};
+    this.resume = false; // set true by run(--resume); replays history + restores agent sessions
+  }
+
+  // ── FEATURE #1: State Persistence ──────────────────────────────────────────
+  // Persist room state so a closed room can be reconnected with --resume. Written on
+  // launch, /add, /kick, and shutdown. Best-effort: a write failure must never crash
+  // the hub, so all fs is guarded.
+  writeState() {
+    try {
+      const file = stateFilePathFor(this.roomId);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const state = serializeState(this.roomId, this.members, this.programs, this.resumeInfo);
+      fs.writeFileSync(file, JSON.stringify(state, null, 2));
+    } catch (e) {
+      // Non-fatal: resume just won't be available if we couldn't persist.
+      printError(`Could not write state file: ${e.message}`);
+    }
+  }
+
+  /** FEATURE #1: read + parse the state file for --resume. Returns the deserialized
+   *  { roomId, agents } or null if absent/unreadable/empty (caller falls back to fresh). */
+  loadStateForResume() {
+    try {
+      const file = stateFilePathFor(this.roomId);
+      if (!fs.existsSync(file)) return null;
+      const obj = JSON.parse(fs.readFileSync(file, "utf8"));
+      const state = deserializeState(obj);
+      if (!state || state.agents.length === 0) return null;
+      return state;
+    } catch (e) {
+      printError(`Could not read state file: ${e.message}`);
+      return null;
+    }
   }
 
   // ── Socket Connection ────────────────────────────────────────────────────
@@ -1113,17 +1285,47 @@ class RoomHub {
     activeRl = this.rl; // route async output above the input line
     this.rl.prompt();
 
+    // FIX #5: COALESCE rapid consecutive 'line' events into ONE message. readline fires a
+    // 'line' per newline, so pasting an N-line block would otherwise send N separate room
+    // messages. We buffer each line and (re)start a short timer; another 'line' before it
+    // fires means a paste burst (append). When the timer fires quiet, we submit the buffer
+    // joined with "\n" (preserving multi-line structure). A single typed line → one 'line' →
+    // timer → one message (UX unchanged). The first buffered line decides command/@mention
+    // handling; the whole coalesced text is then treated as one input.
+    this._pasteBuf = [];
+    this._pasteTimer = null;
     this.rl.on("line", (line) => {
-      const text = line.trim();
-      if (!text) {
+      this._pasteBuf.push(line);
+      if (this._pasteTimer) clearTimeout(this._pasteTimer);
+      this._pasteTimer = setTimeout(() => {
+        const buffered = this._pasteBuf;
+        this._pasteBuf = [];
+        this._pasteTimer = null;
+        const text = coalesceLines(buffered).trim();
+        this.handleInput(text);
         this.rl.prompt();
+      }, PASTE_COALESCE_MS);
+    });
+
+    this.rl.on("close", () => {
+      activeRl = null; // stop routing through a closed interface
+      this.shutdown("stdin closed");
+    });
+  }
+
+  /**
+   * FIX #5: handle ONE complete (possibly coalesced multi-line) human input. Factored out
+   * of the on('line') handler so both the paste-flush timer and any future direct caller use
+   * the same parsing. Commands (/...) and @mentions are detected on the FULL coalesced text.
+   */
+  handleInput(text) {
+      if (!text) {
         return;
       }
 
       // Handle commands
       if (text.startsWith("/")) {
         this.handleCommand(text);
-        this.rl.prompt();
         return;
       }
 
@@ -1173,14 +1375,6 @@ class RoomHub {
         }
       };
       doSend().catch((e) => printError(`Human send error: ${e.message}`));
-
-      this.rl.prompt();
-    });
-
-    this.rl.on("close", () => {
-      activeRl = null; // stop routing through a closed interface
-      this.shutdown("stdin closed");
-    });
   }
 
   handleCommand(text) {
@@ -1230,7 +1424,11 @@ class RoomHub {
           "  /resume               — unblock circuit-breaker\n" +
           "  /who                  — list members + their programs\n" +
           "  /add <name>[:program] — add an agent (program = claude|codex; default claude)\n" +
-          "  /kick <name>          — remove an agent from the room"
+          "  /kick <name>          — remove an agent from the room\n" +
+          "  paste multi-line text — pasted blocks are sent as ONE message (not one per line)\n" +
+          "Reconnect (from the shell, after the room is closed):\n" +
+          "  agentbus-room <id> --resume      — replay history + restore each agent's session\n" +
+          "  agentbus-room <id> --no-agents   — re-attach to agents still running (hub died, agents survived)"
         );
         break;
       default:
@@ -1272,6 +1470,7 @@ class RoomHub {
         return;
       }
       await seedAgent(name, this.members, this.roomId);
+      this.writeState(); // FEATURE #1: persist the new member + its resume handle
       printSystemMsg(`Added ${name} (${program})`);
     };
     doAdd().catch((e) => {
@@ -1281,6 +1480,7 @@ class RoomHub {
       // and leaving it in members would make every future relay target a dead busId.
       this.members = this.members.filter((m) => m !== name);
       delete this.programs[name];
+      delete this.resumeInfo[name];
       this.clearWorking(name);
     });
   }
@@ -1306,13 +1506,17 @@ class RoomHub {
     // own 'exit' handler also prunes members — harmless double-removal via filter.)
     this.members = this.members.filter((m) => m !== name);
     delete this.programs[name];
+    delete this.resumeInfo[name]; // FEATURE #1: drop its resume handle (it's being removed for good)
     this.clearWorking(name);
     if (idx !== -1) this.children.splice(idx, 1);
+    this.writeState(); // FEATURE #1: persist the smaller roster
 
     const doKick = async () => {
       if (entry) {
         // unlinkEmptyMcp:false — emptyMcp is a per-room shared file other claude agents use.
-        await this.teardownChild(entry, { unlinkEmptyMcp: false });
+        // removeCodexHome:true — /kick is a permanent removal, so wipe the stable codex home
+        // (normal shutdown KEEPS it for resume; only /kick deletes it).
+        await this.teardownChild(entry, { unlinkEmptyMcp: false, removeCodexHome: true });
       }
       // Deregister the agent's busId on the bus (the name it registered under). Killing the
       // `agentbus run` child already drops its connection; this is an explicit belt-and-braces
@@ -1335,15 +1539,21 @@ class RoomHub {
    * launched agent in its system prompt (display names).
    * Returns the children entry just pushed.
    */
-  spawnMember(agentName, program, launchDir, rosterForPrompt) {
-    const { child, spFile, transcriptFile, emptyMcp, codexHome, workDir } = launchAgent(
+  spawnMember(agentName, program, launchDir, rosterForPrompt, resume = {}) {
+    const { child, spFile, transcriptFile, emptyMcp, codexHome, claudeSessionId } = launchAgent(
       agentName,
       program,
       rosterForPrompt,
       this.roomId,
       launchDir,
-      os.tmpdir()
+      os.tmpdir(),
+      resume
     );
+    // FEATURE #1: record this agent's resume handle so writeState() persists it.
+    // codex → its stable home; claude → the pinned session uuid.
+    this.resumeInfo[agentName] = {};
+    if (codexHome) this.resumeInfo[agentName].codexHome = codexHome;
+    if (claudeSessionId) this.resumeInfo[agentName].claudeSessionId = claudeSessionId;
     // M3: attach exit handler here where 'this' is bound, so dead agents are pruned
     // from the fan-out member list immediately (prevents relaying to dead agents).
     // (A) prune by DISPLAY name (this.members holds display names).
@@ -1353,8 +1563,8 @@ class RoomHub {
       this.members = this.members.filter((m) => m !== agentName);
       this.clearWorking(agentName); // drop any stale "working" flag
     });
-    // codexHome/workDir are undefined for claude agents — harmless in shutdown (guarded).
-    const entry = { child, spFile, agentName, transcriptFile, emptyMcp, codexHome, workDir };
+    // codexHome is undefined for claude agents — harmless in shutdown (guarded).
+    const entry = { child, spFile, agentName, transcriptFile, emptyMcp, codexHome };
     this.children.push(entry);
     return entry;
   }
@@ -1384,12 +1594,14 @@ class RoomHub {
     return true;
   }
 
-  async launchAgents(launchDir) {
+  async launchAgents(launchDir, resumeHandles = {}) {
     const allAgentNames = [...this.members];
 
     for (const agentName of this.members) {
       const program = this.programs[agentName] || "claude";
-      this.spawnMember(agentName, program, launchDir, allAgentNames);
+      // FEATURE #1: on --resume, pass each agent its restore handle so launchAgent
+      // relaunches the prior session (codex resume / claude --resume <uuid>).
+      this.spawnMember(agentName, program, launchDir, allAgentNames, resumeHandles[agentName] || {});
     }
 
     // Wait for all agents to register + become ready, detecting dead children.
@@ -1400,6 +1612,33 @@ class RoomHub {
     if (this.members.length === 0) {
       printError(`No agents are alive — the room has no participants. Check agent transcripts in ${os.tmpdir()}.`);
     }
+  }
+
+  // ── FEATURE #1: History Replay (on --resume) ───────────────────────────────
+  /**
+   * Replay the prior thread from the DB tail behind a dim divider, so a reconnected
+   * room shows where the conversation left off. Caps at the last ~150 rows. Does NOT
+   * advance renderCursor — startRender()'s initCursor sets it to MAX(rowid) afterward,
+   * so live messages continue cleanly without re-rendering this history.
+   */
+  async replayHistory(limit = 150) {
+    const db = dbPath();
+    if (!fs.existsSync(db)) return;
+    const sql = buildReplaySql(this.roomId, this.roomBus, limit);
+    const rows = await new Promise((resolve) => {
+      execFile("sqlite3", ["-json", db, sql], { timeout: 5000, encoding: "utf8" }, (err, stdout) => {
+        if (err) { resolve([]); return; }
+        try {
+          const out = (stdout || "").trim();
+          resolve(!out || out === "[]" ? [] : JSON.parse(out));
+        } catch { resolve([]); }
+      });
+    });
+    if (rows.length === 0) return;
+    // DESC+LIMIT gave us the TAIL newest-first; reverse to chronological order.
+    rows.reverse();
+    for (const row of rows) renderMessage(row, this.roomId);
+    writeOut(`\n${C.DIM}──── resumed · history above ────${C.RESET}\n`);
   }
 
   // ── Seed Agents ───────────────────────────────────────────────────────────
@@ -1419,8 +1658,10 @@ class RoomHub {
    * H2/H3 semantics preserved. `unlinkEmptyMcp` defaults true (full shutdown); /kick passes
    * false because emptyMcp is a per-ROOM shared file (empty-mcp-<roomId>.json) that surviving
    * claude agents may still reference — it's recreated by the existsSync guard on next /add.
+   * `removeCodexHome` defaults false: the codex CODEX_HOME is STABLE and holds the resumable
+   * session, so it survives normal shutdown; only /kick passes true to delete it permanently.
    */
-  teardownChild({ child, agentName, spFile, emptyMcp, codexHome, workDir }, { unlinkEmptyMcp = true } = {}) {
+  teardownChild({ child, agentName, spFile, emptyMcp, codexHome }, { unlinkEmptyMcp = true, removeCodexHome = false } = {}) {
     return new Promise((resolve) => {
       let done = false;
       const finish = () => { if (!done) { done = true; resolve(); } };
@@ -1452,9 +1693,12 @@ class RoomHub {
       if (unlinkEmptyMcp) {
         try { if (emptyMcp && fs.existsSync(emptyMcp)) fs.unlinkSync(emptyMcp); } catch {}
       }
-      // Codex teardown: remove the per-agent isolated CODEX_HOME and WORKDIR.
-      try { if (codexHome && fs.existsSync(codexHome)) fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
-      try { if (workDir && fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+      // FEATURE #1: the codex CODEX_HOME is now STABLE (holds the resumable session).
+      // KEEP it on normal shutdown so `--resume` works; only DELETE it on /kick
+      // (the agent is being permanently removed). removeCodexHome drives this.
+      if (removeCodexHome) {
+        try { if (codexHome && fs.existsSync(codexHome)) fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+      }
     });
   }
 
@@ -1462,6 +1706,10 @@ class RoomHub {
     if (!this.running) return;
     this.running = false;
     printSystemMsg(`Shutting down: ${reason}`);
+
+    // FEATURE #1: persist final state BEFORE killing children / exiting, so --resume
+    // can later restore this exact roster + each agent's session handle.
+    this.writeState();
 
     this.stopRender();
 
@@ -1544,12 +1792,43 @@ class RoomHub {
       `${C.BOLD}${C.CYAN}══════════════════════════════════════════${C.RESET}\n\n`
     );
 
+    // FEATURE #1: --resume — load prior state, replay history, restore agent sessions.
+    let resumeHandles = {};
+    let resuming = false;
+    if (this.resume) {
+      const loaded = this.loadStateForResume();
+      if (loaded) {
+        resuming = true;
+        // Adopt the persisted roster (overrides whatever --agents was passed).
+        this.members = loaded.agents.map((a) => a.name);
+        this.programs = {};
+        for (const a of loaded.agents) {
+          this.programs[a.name] = a.program;
+          // codex → resume:true; claude → restore its pinned session id.
+          resumeHandles[a.name] = a.program === "codex"
+            ? { codex: true }
+            : { claudeSessionId: a.claudeSessionId || null };
+        }
+        printSystemMsg(`Resuming room "${this.roomId}" with ${this.members.length} agent(s): ${this.members.join(", ")}`);
+        // Replay the prior thread BEFORE relaunching agents so the human sees context first.
+        await this.replayHistory(150);
+      } else {
+        printSystemMsg(`--resume: no saved state for "${this.roomId}" — starting fresh.`);
+      }
+    }
+
     // 4. Launch agents (if any configured)
     if (this.members.length > 0) {
-      await this.launchAgents(launchDir);
-      // 5. Seed agents (H1: await async sendMessage inside seedAll)
-      await this.seedAll();
+      await this.launchAgents(launchDir, resumeHandles);
+      // 5. Seed agents (H1: await async sendMessage inside seedAll).
+      // FEATURE #1: on resume, SKIP seeding — each agent restores its own context from its
+      // session; re-seeding would fight that (it'd re-introduce the "welcome" framing).
+      if (!resuming) {
+        await this.seedAll();
+      }
     }
+    // Persist initial state so a crash/close mid-session is still resumable.
+    this.writeState();
 
     // 6. Start DB tail renderer
     this.startRender();
@@ -1856,11 +2135,12 @@ async function runSelfTest() {
   process.stdout.write(`\n${C.BOLD}buildCodexConfigToml${C.RESET}\n`);
 
   {
-    const wd = "/tmp/codex-work-r1-codex-A";
+    // FIX #4: the trusted dir is the user's launchDir (codex --cd target), not a tmp workdir.
+    const wd = "/Users/ram/CODE/myproject";
     const toml = buildCodexConfigToml(wd);
     assert("codex toml: model gpt-5.5", toml.includes('model = "gpt-5.5"'));
     assert("codex toml: reasoning effort low", toml.includes('model_reasoning_effort = "low"'));
-    assert("codex toml: projects key references workdir", toml.includes(`[projects."${wd}"]`));
+    assert("codex toml: projects key references trusted dir", toml.includes(`[projects."${wd}"]`));
     assert("codex toml: trust_level trusted", toml.includes('trust_level = "trusted"'));
     // The MCP boot stall is avoided by NOT emitting any [mcp_servers.*] section.
     assert("codex toml: no mcp_servers section", !toml.includes("mcp_servers"));
@@ -2005,6 +2285,97 @@ async function runSelfTest() {
     assert("/kick member check: ghost is NOT member", !members.includes("ghost"));
   }
 
+  // ── FIX #5: coalesceLines (paste coalescing pure core) ─────────────────────
+
+  process.stdout.write(`\n${C.BOLD}FIX #5: coalesceLines${C.RESET}\n`);
+
+  {
+    // Single typed line → unchanged (one 'line' event → one message).
+    assert("coalesce single line unchanged", coalesceLines(["hello world"]) === "hello world");
+    // Multi-line paste → joined with "\n", structure preserved.
+    assert("coalesce multi-line joins with newline", coalesceLines(["a", "b", "c"]) === "a\nb\nc");
+    // Blank lines within a paste are preserved (not collapsed).
+    assert("coalesce preserves internal blank lines", coalesceLines(["a", "", "b"]) === "a\n\nb");
+    // A command pasted as the first line stays a command after coalescing (handleInput
+    // routes on the FULL coalesced text; here we just verify the join keeps the leading "/").
+    assert("coalesce keeps leading command token", coalesceLines(["/who", "extra"]).startsWith("/who"));
+    // An @mention as the first line is preserved at the head of the coalesced text.
+    assert("coalesce keeps leading @mention", coalesceLines(["@claude-A do this", "and that"]).startsWith("@claude-A"));
+    // Empty buffer → empty string (defensive; trimmed to "" → handleInput no-ops).
+    assert("coalesce empty buffer → empty string", coalesceLines([]) === "");
+    // The coalescing window is a tunable const.
+    assert("paste coalesce window is a positive const", typeof PASTE_COALESCE_MS === "number" && PASTE_COALESCE_MS > 0);
+  }
+
+  // ── FIX #4: buildCodexConfigToml trusts the launchDir ──────────────────────
+
+  process.stdout.write(`\n${C.BOLD}FIX #4: codex config trusts launchDir${C.RESET}\n`);
+
+  {
+    // FIX #4: the trusted dir is now the USER'S launchDir, not a tmp workdir.
+    const launchDir = "/Users/ram/CODE/myproject";
+    const toml = buildCodexConfigToml(launchDir);
+    assert("codex toml: trusts the launchDir", toml.includes(`[projects."${launchDir}"]`));
+    assert("codex toml: launchDir trusted", toml.includes('trust_level = "trusted"'));
+    // Still no MCP servers section (boot-stall avoidance unchanged).
+    assert("codex toml: still no mcp_servers", !toml.includes("mcp_servers"));
+  }
+
+  // ── FEATURE #1: state path / codex home / (de)serialize / replay SQL ────────
+
+  process.stdout.write(`\n${C.BOLD}FEATURE #1: resume state helpers${C.RESET}\n`);
+
+  {
+    // stateFilePathFor honors AGENTBUS_DIR (set it temporarily, restore after).
+    const savedDir = process.env.AGENTBUS_DIR;
+    process.env.AGENTBUS_DIR = "/tmp/ab-test";
+    assert("stateFilePathFor: under AGENTBUS_DIR/rooms", stateFilePathFor("r1") === "/tmp/ab-test/rooms/r1.json");
+    assert("codexHomeFor: stable path under rooms/<id>", codexHomeFor("r1", "codex-A") === "/tmp/ab-test/rooms/r1/codex-codex-A");
+    assert("codexHomeFor: NOT in tmpdir", !codexHomeFor("r1", "codex-A").startsWith(os.tmpdir()));
+    if (savedDir === undefined) delete process.env.AGENTBUS_DIR; else process.env.AGENTBUS_DIR = savedDir;
+
+    // serialize → deserialize round-trip preserves roster, programs, and resume handles.
+    const members = ["claude-A", "codex-A"];
+    const programs = { "claude-A": "claude", "codex-A": "codex" };
+    const resumeInfo = {
+      "claude-A": { claudeSessionId: "11111111-2222-3333-4444-555555555555" },
+      "codex-A": { codexHome: "/tmp/ab-test/rooms/r1/codex-codex-A" },
+    };
+    const state = serializeState("r1", members, programs, resumeInfo);
+    assert("serializeState: roomId", state.roomId === "r1");
+    assert("serializeState: 2 agents", state.agents.length === 2);
+    assert("serializeState: claude carries session id", state.agents[0].claudeSessionId === "11111111-2222-3333-4444-555555555555");
+    assert("serializeState: codex carries home", state.agents[1].codexHome === "/tmp/ab-test/rooms/r1/codex-codex-A");
+    assert("serializeState: has updatedAt timestamp", typeof state.updatedAt === "string" && state.updatedAt.length > 0);
+
+    const back = deserializeState(JSON.parse(JSON.stringify(state)));
+    assert("deserializeState: roomId round-trips", back.roomId === "r1");
+    assert("deserializeState: names round-trip", deepEqual(back.agents.map((a) => a.name), members));
+    assert("deserializeState: programs round-trip", back.agents[0].program === "claude" && back.agents[1].program === "codex");
+    assert("deserializeState: claude session id round-trips", back.agents[0].claudeSessionId === "11111111-2222-3333-4444-555555555555");
+    assert("deserializeState: codex home round-trips", back.agents[1].codexHome === "/tmp/ab-test/rooms/r1/codex-codex-A");
+
+    // deserialize is defensive: bad shapes → null; bad program → claude; bad name → dropped.
+    assert("deserializeState: null on non-object", deserializeState(null) === null);
+    assert("deserializeState: null on missing agents array", deserializeState({ roomId: "r1" }) === null);
+    const sanitized = deserializeState({ roomId: "r1", agents: [
+      { name: "ok", program: "gemini" },          // unknown program → coerced to claude
+      { name: "bad name", program: "claude" },      // invalid name → dropped
+      { name: "x", program: "codex" },
+    ]});
+    assert("deserializeState: drops invalid-name agent", sanitized.agents.length === 2);
+    assert("deserializeState: coerces unknown program to claude", sanitized.agents[0].program === "claude");
+
+    // buildReplaySql: tail-capped, DESC, excludes roomBus relay copies, escapes quotes.
+    const sql = buildReplaySql("r1", "room-r1", 150);
+    assert("buildReplaySql: filters by thread_id", sql.includes("thread_id = 'r1'"));
+    assert("buildReplaySql: excludes roomBus relay copies", sql.includes("from_agent != 'room-r1'"));
+    assert("buildReplaySql: orders DESC (tail)", sql.includes("ORDER BY rowid DESC"));
+    assert("buildReplaySql: caps with LIMIT 150", sql.includes("LIMIT 150"));
+    assert("buildReplaySql: coerces limit to int (no injection)", buildReplaySql("r1", "room-r1", "5; DROP TABLE messages").includes("LIMIT 0"));
+    assert("buildReplaySql: escapes single quotes in roomId", buildReplaySql("o'brien", "room-x", 10).includes("thread_id = 'o''brien'"));
+  }
+
   // ── Summary ──────────────────────────────────────────────────────────────
 
   process.stdout.write(`\n${C.DIM}────────────────────────────────────${C.RESET}\n`);
@@ -2027,6 +2398,7 @@ function parseArgs(argv) {
     programs: { "claude-A": "claude", "codex-A": "codex" },
     cbMax: 6,
     launchDir: process.cwd(),
+    resume: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -2055,6 +2427,8 @@ function parseArgs(argv) {
       opts.launchDir = args[++i];
     } else if (a === "--no-agents") {
       opts.agents = [];
+    } else if (a === "--resume") {
+      opts.resume = true;
     } else if (!a.startsWith("--")) {
       // roomId must form a valid AgentBus agent name once namespaced as "room-<roomId>".
       // Reject anything outside [A-Za-z0-9_-] so the derived bus identity is always valid.
@@ -2082,15 +2456,18 @@ async function main() {
 
   if (!opts.roomId) {
     process.stderr.write(
-      "Usage: agentbus-room.mjs <room-id> [--agents name[:program],...] [--cb-max 6] [--launch-dir <dir>] [--no-agents]\n" +
+      "Usage: agentbus-room.mjs <room-id> [--agents name[:program],...] [--cb-max 6] [--launch-dir <dir>] [--no-agents] [--resume]\n" +
       "       --agents accepts `name:program` (program = claude|codex); a bare name defaults to claude.\n" +
       "       e.g. --agents claude-A,codex-A:codex\n" +
+      "       --resume    reconnect to a closed room: replay history + restore each agent's session\n" +
+      "       --no-agents attach to agents already running (hub-died-but-agents-survived reconnect)\n" +
       "       agentbus-room.mjs --self-test\n"
     );
     process.exit(1);
   }
 
   const hub = new RoomHub(opts.roomId, opts.agents, opts.cbMax, opts.programs);
+  hub.resume = opts.resume; // FEATURE #1: --resume restores history + agent sessions
 
   // Handle SIGINT for clean teardown
   process.on("SIGINT", () => {
