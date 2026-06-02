@@ -709,6 +709,7 @@ class RoomHub {
     this.reconnecting = false; // H4: guard against double-reconnect race
     this.rl = null; // readline interface for human input
     this.pausedMessages = []; // M4: buffer messages suppressed by circuit-breaker for flush on /resume
+    this.working = new Set(); // (C) agents we relayed to but haven't heard back from — drives "is working…"
   }
 
   // ── Socket Connection ────────────────────────────────────────────────────
@@ -883,6 +884,8 @@ class RoomHub {
   }
 
   async handleIncomingMessage(msg) {
+    // (C) the sender just spoke — it's no longer "working".
+    this.clearWorking(msg.from);
     // Update circuit-breaker
     const tripped = this.cb.recordAgentMessage();
     if (tripped) {
@@ -912,6 +915,17 @@ class RoomHub {
     }
   }
 
+  // ── (C) "is working…" indicator ─────────────────────────────────────────────
+  // We mark an agent "working" the moment we relay a message TO it, and clear it
+  // when a message FROM it arrives. Ephemeral, hub-side only (never a bus/DB row).
+  markWorking(name) {
+    if (!this.working.has(name)) {
+      this.working.add(name);
+      printSystemMsg(`${C.DIM}${name} is working…${C.RESET}`);
+    }
+  }
+  clearWorking(name) { this.working.delete(name); }
+
   async relay(msg, targetOverride) {
     const fanout = computeFanout(msg, this.members, targetOverride);
     // H1: yield between successive relays so socket 'data' events can fire in between.
@@ -922,6 +936,8 @@ class RoomHub {
       const result = await sendMessage(this.roomBus, to, body, this.roomId, "request");
       if (!result.ok) {
         printError(`Relay to ${to} failed: ${result.error}`);
+      } else {
+        this.markWorking(to); // (C) recipient may now respond
       }
     }
   }
@@ -1025,11 +1041,14 @@ class RoomHub {
         // H1: await the async sendMessage
         const prefixedBody = `ram: ${body}`;
         const targets = targetOverride ? [targetOverride] : this.members;
+        this.working.clear(); // (C) fresh human turn — drop stale "working" flags
         for (const to of targets) {
           // Human input is fanned out as if from the room (namespaced bus identity).
           const result = await sendMessage(this.roomBus, to, prefixedBody, this.roomId, "request");
           if (!result.ok) {
             printError(`Send to ${to} failed: ${result.error}`);
+          } else {
+            this.markWorking(to); // (C) we now expect a reply from this agent
           }
         }
       };
