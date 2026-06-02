@@ -383,6 +383,28 @@ function appendLog(roomId, line) {
 // Shared "chat bubble" renderer. A dim horizontal rule + a colored author bar
 // (▌ name · time) + a 2-space-indented body. The rule + indent give clear visual
 // separation between consecutive messages so multi-line replies don't blur together.
+// The active readline interface while the human prompt is up. ALL async output
+// (messages, system lines, errors) goes through writeOut() so it prints ABOVE the
+// input line instead of splitting whatever the user is mid-typing.
+let activeRl = null;
+
+function writeOut(text) {
+  const rl = activeRl;
+  if (rl && process.stdout.isTTY) {
+    readline.cursorTo(process.stdout, 0);
+    readline.clearLine(process.stdout, 0); // wipe the in-progress input line
+    process.stdout.write(text.endsWith("\n") ? text : text + "\n");
+    if (typeof rl._refreshLine === "function") {
+      rl._refreshLine(); // redraw prompt + typed buffer + restore cursor
+    } else {
+      rl.prompt(true);
+      if (rl.line) process.stdout.write(rl.line);
+    }
+  } else {
+    process.stdout.write(text);
+  }
+}
+
 function renderBubble(author, color, time, body, suffix = "") {
   const rule = `${C.DIM}${"─".repeat(58)}${C.RESET}`;
   const indented = String(body ?? "")
@@ -390,7 +412,7 @@ function renderBubble(author, color, time, body, suffix = "") {
     .split("\n")
     .map((l) => `  ${l}`)
     .join("\n");
-  process.stdout.write(
+  writeOut(
     `\n${rule}\n` +
       `${color}${C.BOLD}▌ ${author}${C.RESET}${suffix} ${C.DIM}· ${time}${C.RESET}\n` +
       `${indented}\n`
@@ -411,11 +433,11 @@ function renderMessage(msg, roomId) {
 }
 
 function printSystemMsg(text) {
-  process.stdout.write(`\n${C.DIM}[room] ${text}${C.RESET}\n`);
+  writeOut(`\n${C.DIM}[room] ${text}${C.RESET}\n`);
 }
 
 function printError(text) {
-  process.stdout.write(`\n${C.RED}[room:error] ${text}${C.RESET}\n`);
+  writeOut(`\n${C.RED}[room:error] ${text}${C.RESET}\n`);
 }
 
 // ── AgentBus Send (shell-out) ──────────────────────────────────────────────────
@@ -1082,6 +1104,7 @@ class RoomHub {
       },
     });
 
+    activeRl = this.rl; // route async output above the input line
     this.rl.prompt();
 
     this.rl.on("line", (line) => {
@@ -1149,6 +1172,7 @@ class RoomHub {
     });
 
     this.rl.on("close", () => {
+      activeRl = null; // stop routing through a closed interface
       this.shutdown("stdin closed");
     });
   }
