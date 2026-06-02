@@ -55,15 +55,21 @@ const C = {
   MAGENTA: "\x1b[35m",
   BLUE:    "\x1b[34m",
   WHITE:   "\x1b[37m",
+  // bright variants — ram gets BRGREEN to stand out; agents draw from the bright palette
+  BRGREEN:   "\x1b[92m",
+  BRCYAN:    "\x1b[96m",
+  BRYELLOW:  "\x1b[93m",
+  BRMAGENTA: "\x1b[95m",
+  BRBLUE:    "\x1b[94m",
 };
 
-/** Deterministic color assignment for agent names. */
-const AGENT_COLORS = [C.CYAN, C.YELLOW, C.MAGENTA, C.GREEN, C.BLUE];
+/** Deterministic color assignment for agent names. GREEN is reserved for the human (ram). */
+const AGENT_COLORS = [C.CYAN, C.YELLOW, C.MAGENTA, C.BLUE, C.BRCYAN, C.BRYELLOW, C.BRMAGENTA, C.BRBLUE];
 const colorCache = new Map();
 let colorIdx = 0;
 
 function agentColor(name) {
-  if (name === "ram") return C.GREEN;
+  if (name === "ram") return C.BRGREEN; // human stands out in bright green (reserved)
   // The hub's bus identity is namespaced per room ("room-<roomId>"), but the
   // human-facing label stays "room". Match both so the namespaced sender renders dim.
   if (name === "room" || name.startsWith("room-")) return C.DIM;
