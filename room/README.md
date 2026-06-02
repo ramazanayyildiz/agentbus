@@ -51,8 +51,11 @@ IRC-server that makes multi-party rooms work.
 # Standard: launch hub with two agents, room ID "main"
 node agentbus-room.mjs main
 
-# Custom agents
+# Custom agents — each spec is `name[:program]` (program = claude | codex)
 node agentbus-room.mjs main --agents claude-A,claude-B
+
+# Mixed Claude + Codex room (bare name defaults to claude)
+node agentbus-room.mjs main --agents claude-A,codex-A:codex
 
 # Custom circuit-breaker threshold (default: 6 consecutive agent msgs)
 node agentbus-room.mjs main --cb-max 4
@@ -135,10 +138,17 @@ Both are acceptable for MVP. The render catches divergence for the human to see.
 
 ## Extending
 
-**Add an agent type (Codex):**
-The `agentbus run` invocation in `launchAgent()` currently passes `claude`-specific
-flags. For Codex: replace `--append-system-prompt-file` with Codex's equivalent
-mechanism (e.g. `AGENTS.md` or `--config`) and omit MCP flags.
+**Per-program launch (Claude + Codex, implemented):**
+`launchAgent(name, program, ...)` dispatches to `launchClaudeAgent` (unchanged: spawns
+`claude --append-system-prompt-file …` with an empty strict MCP config) or
+`launchCodexAgent` (spawns `codex --dangerously-bypass-approvals-and-sandbox
+--dangerously-bypass-hook-trust --cd <workdir>` under an isolated per-agent
+`CODEX_HOME`). Codex auth is symlinked from `~/.codex` (auth.json, accounts,
+version.json, models_cache.json); `config.toml` pre-trusts the workdir and omits MCP
+servers; the room system prompt is delivered via `<workdir>/AGENTS.md` (same text the
+Claude path puts in its `--append-system-prompt-file`). Select per agent with
+`--agents name:program`. To add another program, add a `launchXAgent` and extend
+`parseAgentSpec`'s `VALID_PROGRAMS`.
 
 **Model A council mode:**
 Swap the emergent consume-loop for a driven turn-loop. The `CircuitBreaker` and

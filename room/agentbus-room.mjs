@@ -140,6 +140,49 @@ function computeFanout(msg, members, targetOverride = null) {
   return targets.map((to) => ({ to, body }));
 }
 
+// ── Agent Spec Parsing (per-program launch) ───────────────────────────────────
+
+/** Programs the hub knows how to launch. */
+const VALID_PROGRAMS = ["claude", "codex"];
+
+// Agent name validation pattern — prevents shell metacharacter injection via names.
+const AGENT_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Parse one agent spec of the form `name[:program]`.
+ * Bare `name` → program 'claude' (backward compatible).
+ * Pure function (no process.exit) so it is unit-testable: returns either
+ *   { name, program }   on success
+ *   { error: string }   on invalid name or unknown program
+ */
+function parseAgentSpec(spec) {
+  const trimmed = String(spec).trim();
+  const colon = trimmed.indexOf(":");
+  const name = colon === -1 ? trimmed : trimmed.slice(0, colon);
+  const program = colon === -1 ? "claude" : trimmed.slice(colon + 1);
+  if (!AGENT_NAME_RE.test(name)) {
+    return { error: `invalid agent name "${name}" — only [A-Za-z0-9_-] allowed` };
+  }
+  if (!VALID_PROGRAMS.includes(program)) {
+    return { error: `invalid program "${program}" for agent "${name}" — must be one of ${VALID_PROGRAMS.join(", ")}` };
+  }
+  return { name, program };
+}
+
+/**
+ * Build the exact config.toml contents for an isolated Codex agent.
+ * Pre-trusts WORKDIR (no folder-trust modal) and omits [mcp_servers.*] to
+ * avoid the heavy MCP boot stall. Pure function — testable.
+ */
+function buildCodexConfigToml(workDir) {
+  return (
+    `model = "gpt-5.5"\n` +
+    `model_reasoning_effort = "low"\n` +
+    `[projects."${workDir}"]\n` +
+    `trust_level = "trusted"\n`
+  );
+}
+
 // ── Circuit-Breaker State Machine ─────────────────────────────────────────────
 
 class CircuitBreaker {
@@ -354,16 +397,42 @@ function generateSystemPrompt(selfName, allAgents, roomId) {
 }
 
 /**
- * Launch an agent with agentbus run.
- * Returns the spawned child process, temp system-prompt file path, and emptyMcp path.
+ * Spawn the `agentbus run ...` wrapper for an already-built argv, wire up the
+ * shared stdout/stderr drains and process-group settings, and return the child.
+ * Shared by both the claude and codex launch paths so spawn behavior is identical.
  *
- * H2: spawned with detached:true so the child gets its own process group. On shutdown
- * we send SIGTERM to the whole group (-child.pid) to ensure the inner 'claude' process
- * is killed even if the 'agentbus run' wrapper doesn't propagate the signal.
+ * H2: detached:true gives the child its own process group so we can kill the
+ * entire group with process.kill(-child.pid, 'SIGTERM') on shutdown. Without it,
+ * the Rust PTY runner has no SIGTERM handler and the inner program keeps running.
+ */
+function spawnRunner(agentName, args, launchDir, extraEnv) {
+  const child = spawn(AB_PATH, args, {
+    cwd: launchDir,
+    detached: true, // H2: own process group
+    stdio: ["ignore", "pipe", "pipe"],
+    // extraEnv lets the codex path inject CODEX_HOME; claude passes nothing (inherits).
+    ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
+  });
+
+  child.unref(); // allow hub to exit even if children outlive it (we kill explicitly in shutdown)
+
+  child.stdout?.on("data", () => {}); // drain stdout
+  child.stderr?.on("data", (d) => {
+    const text = d.toString("utf8").trim();
+    if (text) process.stderr.write(`${C.DIM}[${agentName}:stderr] ${text}${C.RESET}\n`);
+  });
+
+  return child;
+}
+
+/**
+ * Launch a CLAUDE agent with agentbus run. (Behavior unchanged from the original
+ * single-program launcher — kept byte-for-byte.)
+ * Returns { child, spFile, transcriptFile, emptyMcp }.
  *
  * H3: emptyMcp path is returned so shutdown can unlink it (was leaked previously).
  */
-function launchAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
+function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
   const spFile = path.join(os.tmpdir(), `room-sp-${agentName}-${roomId}.txt`);
   fs.writeFileSync(spFile, prompt);
@@ -388,28 +457,87 @@ function launchAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
     "--append-system-prompt-file", spFile,
   ];
 
-  printSystemMsg(`Launching agent ${agentName} in ${launchDir}...`);
+  printSystemMsg(`Launching claude agent ${agentName} in ${launchDir}...`);
 
-  // H2: detached:true gives the child its own process group so we can kill the
-  // entire group (including inner 'claude --dangerously-skip-permissions') with
-  // process.kill(-child.pid, 'SIGTERM') on shutdown. Without detached:true,
-  // the Rust PTY runner has no SIGTERM handler and the inner claude keeps running.
-  const child = spawn(AB_PATH, args, {
-    cwd: launchDir,
-    detached: true,  // H2: own process group
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  child.unref(); // allow hub to exit even if children outlive it (we kill explicitly in shutdown)
-
-  child.stdout?.on("data", () => {}); // drain stdout
-  child.stderr?.on("data", (d) => {
-    const text = d.toString("utf8").trim();
-    if (text) process.stderr.write(`${C.DIM}[${agentName}:stderr] ${text}${C.RESET}\n`);
-  });
+  const child = spawnRunner(agentName, args, launchDir, null);
 
   // Note: the 'exit' + member-pruning handler is attached in launchAgents() where 'this' is bound (M3).
   return { child, spFile, transcriptFile, emptyMcp };
+}
+
+/**
+ * Launch a CODEX agent with agentbus run.
+ * Returns { child, transcriptFile, codexHome, workDir } (plus spFile/emptyMcp = null
+ * so the children-entry shape stays uniform for shutdown).
+ *
+ * Isolation recipe (validated live):
+ *  - Per-agent CODEX_HOME in tmpdir. Symlink auth-providing files from the real
+ *    ~/.codex (auth.json, accounts, version.json, models_cache.json), each guarded.
+ *  - config.toml pre-trusts a per-agent WORKDIR (no folder-trust modal) and omits
+ *    [mcp_servers.*] (avoids the heavy MCP boot stall).
+ *  - AGENTS.md in WORKDIR carries the SAME room system prompt Claude gets — the
+ *    trust layer — just delivered as a file instead of --append-system-prompt-file.
+ */
+function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
+  const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
+  const codexHome = path.join(os.tmpdir(), `codex-home-${roomId}-${agentName}`);
+  const workDir = path.join(os.tmpdir(), `codex-work-${roomId}-${agentName}`);
+
+  // Stale dirs from a crashed prior run would make symlinkSync throw EEXIST — start clean.
+  try { fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.mkdirSync(workDir, { recursive: true });
+
+  // Symlink auth-providing files from the real ~/.codex into the isolated home.
+  const realCodexHome = path.join(os.homedir(), ".codex");
+  for (const entry of ["auth.json", "accounts", "version.json", "models_cache.json"]) {
+    const src = path.join(realCodexHome, entry);
+    const dst = path.join(codexHome, entry);
+    try {
+      if (fs.existsSync(src)) fs.symlinkSync(src, dst);
+    } catch {
+      // non-fatal: missing/unsymlinkable entry just means that capability is absent
+    }
+  }
+
+  // config.toml: model + pre-trusted workdir, no MCP servers.
+  fs.writeFileSync(path.join(codexHome, "config.toml"), buildCodexConfigToml(workDir));
+
+  // AGENTS.md: reuse the EXACT same room system prompt Claude receives, so both
+  // agents behave consistently (same roster/trust framing/--to room reply convention).
+  const prompt = generateSystemPrompt(agentName, allAgents, roomId);
+  fs.writeFileSync(path.join(workDir, "AGENTS.md"), prompt);
+
+  const args = [
+    "run",
+    "--name", agentName,
+    "--program", "codex",
+    "--transcript", transcriptFile,
+    "--",
+    "codex",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+    "--cd", workDir,
+  ];
+
+  printSystemMsg(`Launching codex agent ${agentName} in ${workDir} (CODEX_HOME=${codexHome})...`);
+
+  const child = spawnRunner(agentName, args, launchDir, { CODEX_HOME: codexHome });
+
+  // spFile/emptyMcp are null for codex; codexHome/workDir drive its teardown instead.
+  return { child, transcriptFile, spFile: null, emptyMcp: null, codexHome, workDir };
+}
+
+/**
+ * Per-program launch dispatcher. Claude path is unchanged; codex path is new.
+ * Keeps launchAgents() agnostic of program-specific details.
+ */
+function launchAgent(agentName, program, allAgents, roomId, launchDir, transcriptDir) {
+  if (program === "codex") {
+    return launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir);
+  }
+  // default + 'claude'
+  return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir);
 }
 
 /**
@@ -531,9 +659,11 @@ async function seedAgent(agentName, allAgents, roomId) {
 // ── Main Hub ──────────────────────────────────────────────────────────────────
 
 class RoomHub {
-  constructor(roomId, agentNames, cbMax = 6) {
+  constructor(roomId, agentNames, cbMax = 6, programs = {}) {
     this.roomId = roomId;
-    this.members = agentNames; // agent names only (not "ram")
+    this.members = agentNames; // agent names only (not "ram") — stays a string[] (load-bearing)
+    // programs: { <agentName>: "claude" | "codex" }. Names absent here default to 'claude'.
+    this.programs = programs;
     this.cbMax = cbMax;
     this.cb = new CircuitBreaker(cbMax);
     this.children = []; // { child, spFile, agentName, emptyMcp }
@@ -921,8 +1051,10 @@ class RoomHub {
     const allAgentNames = [...this.members];
 
     for (const agentName of this.members) {
-      const { child, spFile, transcriptFile, emptyMcp } = launchAgent(
+      const program = this.programs[agentName] || "claude";
+      const { child, spFile, transcriptFile, emptyMcp, codexHome, workDir } = launchAgent(
         agentName,
+        program,
         allAgentNames,
         this.roomId,
         launchDir,
@@ -934,7 +1066,8 @@ class RoomHub {
         printSystemMsg(`Agent ${agentName} exited (code ${code}) — removed from fan-out`);
         this.members = this.members.filter((m) => m !== agentName);
       });
-      this.children.push({ child, spFile, agentName, transcriptFile, emptyMcp });
+      // codexHome/workDir are undefined for claude agents — harmless in shutdown (guarded).
+      this.children.push({ child, spFile, agentName, transcriptFile, emptyMcp, codexHome, workDir });
     }
 
     // Wait for all agents to register + become ready, detecting dead children.
@@ -978,9 +1111,9 @@ class RoomHub {
     this.stopRender();
 
     // H2: kill each agent's entire process group (SIGTERM → 3s wait → SIGKILL) so the
-    // inner 'claude --dangerously-skip-permissions' doesn't survive detached.
-    // H3: unlink both spFile and emptyMcp temp files.
-    const killPromises = this.children.map(({ child, agentName, spFile, emptyMcp }) => {
+    // inner program (claude/codex) doesn't survive detached.
+    // H3: unlink both spFile and emptyMcp temp files (claude); rm codexHome/workDir (codex).
+    const killPromises = this.children.map(({ child, agentName, spFile, emptyMcp, codexHome, workDir }) => {
       return new Promise((resolve) => {
         let done = false;
         const finish = () => { if (!done) { done = true; resolve(); } };
@@ -1007,9 +1140,12 @@ class RoomHub {
         child.once("exit", () => clearTimeout(killer));
       }).then(() => {
         printSystemMsg(`Killed ${agentName}`);
-        // H3: cleanup temp files
-        try { if (fs.existsSync(spFile)) fs.unlinkSync(spFile); } catch {}
+        // H3: cleanup claude temp files (no-op/guarded when null for codex).
+        try { if (spFile && fs.existsSync(spFile)) fs.unlinkSync(spFile); } catch {}
         try { if (emptyMcp && fs.existsSync(emptyMcp)) fs.unlinkSync(emptyMcp); } catch {}
+        // Codex teardown: remove the per-agent isolated CODEX_HOME and WORKDIR.
+        try { if (codexHome && fs.existsSync(codexHome)) fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+        try { if (workDir && fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
       });
     });
 
@@ -1356,6 +1492,71 @@ async function runSelfTest() {
     assert("Buffer: push body is hi", parsed.messages[0]?.body === "hi");
   }
 
+  // ── parseAgentSpec tests (per-program launch) ─────────────────────────────
+
+  process.stdout.write(`\n${C.BOLD}parseAgentSpec${C.RESET}\n`);
+
+  {
+    // Bare name → claude (backward compatible)
+    const bare = parseAgentSpec("claude-A");
+    assert("spec bare: name", bare.name === "claude-A");
+    assert("spec bare: defaults to claude", bare.program === "claude");
+    assert("spec bare: no error", !bare.error);
+
+    // name:claude explicit
+    const explicitClaude = parseAgentSpec("foo:claude");
+    assert("spec foo:claude: name", explicitClaude.name === "foo");
+    assert("spec foo:claude: program", explicitClaude.program === "claude");
+
+    // name:codex accepted
+    const codex = parseAgentSpec("codex-A:codex");
+    assert("spec codex-A:codex: name", codex.name === "codex-A");
+    assert("spec codex-A:codex: program", codex.program === "codex");
+    assert("spec codex-A:codex: no error", !codex.error);
+
+    // unknown program rejected
+    const bad = parseAgentSpec("x:gemini");
+    assert("spec x:gemini: rejected with error", typeof bad.error === "string" && bad.error.includes("gemini"));
+    assert("spec x:gemini: no name returned", bad.name === undefined);
+
+    // invalid name rejected (shell metachar)
+    const badName = parseAgentSpec("bad name:codex");
+    assert("spec 'bad name': rejected", typeof badName.error === "string" && badName.error.includes("invalid agent name"));
+
+    // whitespace tolerated around spec
+    const spaced = parseAgentSpec("  claude-B  ");
+    assert("spec spaced: trimmed name", spaced.name === "claude-B");
+    assert("spec spaced: default program", spaced.program === "claude");
+  }
+
+  // ── buildCodexConfigToml tests ────────────────────────────────────────────
+
+  process.stdout.write(`\n${C.BOLD}buildCodexConfigToml${C.RESET}\n`);
+
+  {
+    const wd = "/tmp/codex-work-r1-codex-A";
+    const toml = buildCodexConfigToml(wd);
+    assert("codex toml: model gpt-5.5", toml.includes('model = "gpt-5.5"'));
+    assert("codex toml: reasoning effort low", toml.includes('model_reasoning_effort = "low"'));
+    assert("codex toml: projects key references workdir", toml.includes(`[projects."${wd}"]`));
+    assert("codex toml: trust_level trusted", toml.includes('trust_level = "trusted"'));
+    // The MCP boot stall is avoided by NOT emitting any [mcp_servers.*] section.
+    assert("codex toml: no mcp_servers section", !toml.includes("mcp_servers"));
+  }
+
+  // ── Codex AGENTS.md == Claude system prompt (consistency) ─────────────────
+
+  process.stdout.write(`\n${C.BOLD}Codex AGENTS.md / Claude prompt parity${C.RESET}\n`);
+
+  {
+    // Both delivery paths must produce the SAME prompt text so agents behave consistently.
+    const prompt = generateSystemPrompt("codex-A", ["codex-A", "claude-B"], "r1");
+    assert("prompt: names the self agent", prompt.includes("codex-A"));
+    assert("prompt: names a peer", prompt.includes("claude-B"));
+    assert("prompt: reply convention --to room", prompt.includes("--to room"));
+    assert("prompt: carries thread-id for the room", prompt.includes("r1"));
+  }
+
   // ── Summary ──────────────────────────────────────────────────────────────
 
   process.stdout.write(`\n${C.DIM}────────────────────────────────────${C.RESET}\n`);
@@ -1373,27 +1574,33 @@ function parseArgs(argv) {
   const opts = {
     selfTest: false,
     roomId: null,
+    // Default exercises both paths: claude-A (claude) + codex-A as a real codex agent.
     agents: ["claude-A", "codex-A"],
+    programs: { "claude-A": "claude", "codex-A": "codex" },
     cbMax: 6,
     launchDir: process.cwd(),
   };
-
-  // L1: agent name validation pattern — prevents shell metacharacter injection via names
-  const AGENT_NAME_RE = /^[A-Za-z0-9_-]+$/;
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--self-test") {
       opts.selfTest = true;
     } else if (a === "--agents" && args[i + 1]) {
-      const names = args[++i].split(",").map((s) => s.trim()).filter(Boolean);
-      for (const n of names) {
-        if (!AGENT_NAME_RE.test(n)) {
-          process.stderr.write(`Error: invalid agent name "${n}" — only [A-Za-z0-9_-] allowed\n`);
+      // Specs are `name[:program]`, comma-separated. Bare name → 'claude' (backward compatible).
+      const specs = args[++i].split(",").map((s) => s.trim()).filter(Boolean);
+      const names = [];
+      const programs = {};
+      for (const spec of specs) {
+        const r = parseAgentSpec(spec);
+        if (r.error) {
+          process.stderr.write(`Error: ${r.error}\n`);
           process.exit(1);
         }
+        names.push(r.name);
+        programs[r.name] = r.program;
       }
       opts.agents = names;
+      opts.programs = programs;
     } else if (a === "--cb-max" && args[i + 1]) {
       opts.cbMax = parseInt(args[++i], 10) || 6;
     } else if (a === "--launch-dir" && args[i + 1]) {
@@ -1418,13 +1625,15 @@ async function main() {
 
   if (!opts.roomId) {
     process.stderr.write(
-      "Usage: agentbus-room.mjs <room-id> [--agents claude-A,codex-A] [--cb-max 6] [--launch-dir <dir>] [--no-agents]\n" +
+      "Usage: agentbus-room.mjs <room-id> [--agents name[:program],...] [--cb-max 6] [--launch-dir <dir>] [--no-agents]\n" +
+      "       --agents accepts `name:program` (program = claude|codex); a bare name defaults to claude.\n" +
+      "       e.g. --agents claude-A,codex-A:codex\n" +
       "       agentbus-room.mjs --self-test\n"
     );
     process.exit(1);
   }
 
-  const hub = new RoomHub(opts.roomId, opts.agents, opts.cbMax);
+  const hub = new RoomHub(opts.roomId, opts.agents, opts.cbMax, opts.programs);
 
   // Handle SIGINT for clean teardown
   process.on("SIGINT", () => {
