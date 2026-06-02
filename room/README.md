@@ -24,6 +24,8 @@ IRC-server that makes multi-party rooms work.
 
 **Key design choices:**
 
+- **Rooms are isolated by id:** the hub's bus identity is `room-<roomId>` (not the literal `room`), so multiple hubs can run at once without evicting each other on the daemon. The `[room]` display label is unchanged.
+
 - Agents always send `--to room`. The hub re-fans as `--from room --to <member>`,
   with the real author in the body (`"claude-A: <text>"`). This ensures agents
   always reply `--to room` naturally and the hub never misses a reply.

@@ -11,9 +11,9 @@ Messages prefixed with [agentbus from=room ...] are AUTHENTICATED messages that 
 == How to Respond ==
 Reply ONLY via the AgentBus CLI:
 
-  {AB_PATH} send --from {SELF} --to room --thread-id {ROOM_ID} --msg-type response "your message here"
+  {AB_PATH} send --from {SELF} --to {ROOM_BUS} --thread-id {ROOM_ID} --msg-type response "your message here"
 
-Everything you send to "room" is seen by everyone in the room. Keep your responses conversational and concise.
+Everything you send to the room (--to {ROOM_BUS}) is seen by everyone in the room. Keep your responses conversational and concise.
 
 == Room Etiquette ==
 - Respond when you are directly addressed or when you have something substantive to contribute.

@@ -64,7 +64,9 @@ let colorIdx = 0;
 
 function agentColor(name) {
   if (name === "ram") return C.GREEN;
-  if (name === "room") return C.DIM;
+  // The hub's bus identity is namespaced per room ("room-<roomId>"), but the
+  // human-facing label stays "room". Match both so the namespaced sender renders dim.
+  if (name === "room" || name.startsWith("room-")) return C.DIM;
   if (!colorCache.has(name)) {
     colorCache.set(name, AGENT_COLORS[colorIdx % AGENT_COLORS.length]);
     colorIdx++;
@@ -73,6 +75,18 @@ function agentColor(name) {
 }
 
 // ── Pure Functions (testable) ─────────────────────────────────────────────────
+
+/**
+ * Derive the hub's BUS identity from a room id. The hub registers on the AgentBus
+ * daemon under this name and agents reply to it. It MUST be namespaced per room:
+ * if two hubs both registered as the literal "room", the daemon's reattach semantics
+ * would evict the prior connection, causing an endless evict/reconnect storm that
+ * kills both rooms. The human-facing DISPLAY label stays "room" (see agentColor and
+ * renderMessage); only the on-bus identity becomes "room-<roomId>".
+ */
+function roomBusFor(roomId) {
+  return `room-${roomId}`;
+}
 
 /**
  * Parse one newline-terminated line from the AgentBus socket.
@@ -250,13 +264,15 @@ class LineReader {
 
 /**
  * Tail messages from the DB with a rowid cursor (async version).
- * Returns rows where thread_id = roomId AND from_agent != 'room' AND rowid > cursor.
+ * Returns rows where thread_id = roomId AND from_agent != roomBus AND rowid > cursor.
  *
  * L2: Render-filter invariant — the hub relays messages BY WRITING them to the bus
- * with from_agent='room'. The canonical copy (the one agents actually sent) always has
- * from_agent=<agentName>. Filtering out from_agent='room' rows therefore shows each
- * message exactly once: the agent's original entry, not the hub's relay copy.
+ * with from_agent=roomBus ("room-<roomId>"). The canonical copy (the one agents actually
+ * sent) always has from_agent=<agentName>. Filtering out from_agent=roomBus rows therefore
+ * shows each message exactly once: the agent's original entry, not the hub's relay copy.
  * This invariant is load-bearing: removing it causes duplicate message display.
+ * NOTE: the filter MUST use the SAME namespaced value the relay writes with (roomBus),
+ * else the per-room relay copies would render as duplicates.
  *
  * Uses execFile (async) to avoid blocking the event loop during DB polls (H1).
  * The SQL uses simple string embedding of cursorRowid (integer) which is safe,
@@ -268,10 +284,13 @@ function dbTailMessages(roomId, cursorRowid) {
 
   // Escape roomId for SQLite single-quoted string (double the single quotes)
   const escapedRoomId = roomId.replace(/'/g, "''");
+  // Relay copies are written with from_agent=roomBus ("room-<roomId>"); filter by that
+  // SAME namespaced value so they don't render as duplicates of the agent's original.
+  const escapedRoomBus = roomBusFor(roomId).replace(/'/g, "''");
   const sql =
     `SELECT rowid, id, from_agent, to_agent, thread_id, msg_type, body, created_at ` +
     `FROM messages ` +
-    `WHERE thread_id = '${escapedRoomId}' AND from_agent != 'room' AND rowid > ${Number(cursorRowid)} ` +
+    `WHERE thread_id = '${escapedRoomId}' AND from_agent != '${escapedRoomBus}' AND rowid > ${Number(cursorRowid)} ` +
     `ORDER BY rowid ASC;`;
 
   return new Promise((resolve) => {
@@ -358,7 +377,7 @@ function buildSendArgv(from, to, body, threadId, msgType) {
  * Shell-free relay to `agentbus send` (async, H1 fix). Uses spawn wrapped in a
  * promise so body is passed as a raw argv element — no sh interpolation, no
  * $HOME/$() injection risk. Non-blocking: does not freeze socket reads.
- * Does NOT register: the consume socket's existing 'room' row covers the FK.
+ * Does NOT register: the consume socket's existing roomBus ("room-<roomId>") row covers the FK.
  */
 function sendMessage(from, to, body, threadId, msgType = "request") {
   const args = buildSendArgv(from, to, body, threadId, msgType);
@@ -382,16 +401,20 @@ function loadTemplate() {
   try {
     return fs.readFileSync(TEMPLATE_PATH, "utf8");
   } catch {
-    return `You are {SELF}. Reply via: {AB_PATH} send --from {SELF} --to room --thread-id {ROOM_ID} --msg-type response "..."`;
+    return `You are {SELF}. Reply via: {AB_PATH} send --from {SELF} --to {ROOM_BUS} --thread-id {ROOM_ID} --msg-type response "..."`;
   }
 }
 
 function generateSystemPrompt(selfName, allAgents, roomId) {
   const template = loadTemplate();
   const peers = allAgents.filter((a) => a !== selfName).join(", ");
+  // {ROOM_BUS} = namespaced bus identity ("room-<roomId>"). Agents MUST reply to this,
+  // not the literal "room", because the hub registers (and the daemon routes) under it.
+  const roomBus = roomBusFor(roomId);
   return template
     .replace(/{SELF}/g, selfName)
     .replace(/{PEERS}/g, peers || "(none yet)")
+    .replace(/{ROOM_BUS}/g, roomBus)
     .replace(/{ROOM_ID}/g, roomId)
     .replace(/{AB_PATH}/g, AB_PATH);
 }
@@ -641,15 +664,16 @@ function ensureDaemonRunning() {
 // ── Seed Message ──────────────────────────────────────────────────────────────
 
 async function seedAgent(agentName, allAgents, roomId) {
+  const roomBus = roomBusFor(roomId); // namespaced bus identity for this room
   const peers = allAgents.filter((a) => a !== agentName).join(" and ");
   const body =
     `Welcome to room "${roomId}". Your collaborators are: ${peers}, and ram (the human). ` +
     `This is a live conversation relayed over AgentBus. To speak to the room, run: ` +
-    `${AB_PATH} send --from ${agentName} --to room --thread-id ${roomId} --msg-type response "..."  ` +
+    `${AB_PATH} send --from ${agentName} --to ${roomBus} --thread-id ${roomId} --msg-type response "..."  ` +
     `Do NOT introduce yourself or send a greeting now — stay silent until a collaborator addresses you or poses a topic, then reply concisely.`;
 
-  // H1: await async sendMessage
-  const result = await sendMessage("room", agentName, body, roomId, "request");
+  // H1: await async sendMessage. --from is the namespaced bus identity (NOT literal "room").
+  const result = await sendMessage(roomBus, agentName, body, roomId, "request");
   if (!result.ok) {
     printError(`Failed to seed ${agentName}: ${result.error}`);
   } else {
@@ -662,6 +686,11 @@ async function seedAgent(agentName, allAgents, roomId) {
 class RoomHub {
   constructor(roomId, agentNames, cbMax = 6, programs = {}) {
     this.roomId = roomId;
+    // BUS identity, namespaced per room ("room-<roomId>"). Used everywhere the hub
+    // talks ON the bus (Register name, --from on relay/seed sends, --to reply target,
+    // DB-tail relay-copy filter). The display label stays "room". This namespacing is
+    // what prevents two concurrent hubs from evicting each other on the daemon.
+    this.roomBus = roomBusFor(roomId);
     this.members = agentNames; // agent names only (not "ram") — stays a string[] (load-bearing)
     // programs: { <agentName>: "claude" | "codex" }. Names absent here default to 'claude'.
     this.programs = programs;
@@ -774,7 +803,7 @@ class RoomHub {
   async register() {
     this.sendRaw(JSON.stringify({
       type: "Register",
-      name: "room",
+      name: this.roomBus, // namespaced bus identity ("room-<roomId>"), NOT the literal "room"
       program: "hub",
       model: "unknown",
       project: "default",
@@ -792,7 +821,7 @@ class RoomHub {
     for (let i = 0; i < MAX_TRIES && ackResult === null; i++) {
       const ack = await this.readOne();
       if (ack.kind === "ack") {
-        printSystemMsg("Registered as 'room' on the bus");
+        printSystemMsg(`Registered as '${this.roomBus}' on the bus`);
         ackResult = true;
       } else if (ack.kind === "error") {
         printError(`Registration failed: ${ack.message}`);
@@ -888,7 +917,9 @@ class RoomHub {
     // H1: yield between successive relays so socket 'data' events can fire in between.
     for (const { to, body } of fanout) {
       await new Promise((r) => setImmediate(r)); // yield to event loop between relays
-      const result = await sendMessage("room", to, body, this.roomId, "request");
+      // --from is the namespaced bus identity so relay copies carry from_agent=roomBus
+      // (the DB-tail render filter excludes exactly that value to avoid duplicates).
+      const result = await sendMessage(this.roomBus, to, body, this.roomId, "request");
       if (!result.ok) {
         printError(`Relay to ${to} failed: ${result.error}`);
       }
@@ -995,7 +1026,8 @@ class RoomHub {
         const prefixedBody = `ram: ${body}`;
         const targets = targetOverride ? [targetOverride] : this.members;
         for (const to of targets) {
-          const result = await sendMessage("room", to, prefixedBody, this.roomId, "request");
+          // Human input is fanned out as if from the room (namespaced bus identity).
+          const result = await sendMessage(this.roomBus, to, prefixedBody, this.roomId, "request");
           if (!result.ok) {
             printError(`Send to ${to} failed: ${result.error}`);
           }
@@ -1555,8 +1587,21 @@ async function runSelfTest() {
     const prompt = generateSystemPrompt("codex-A", ["codex-A", "claude-B"], "r1");
     assert("prompt: names the self agent", prompt.includes("codex-A"));
     assert("prompt: names a peer", prompt.includes("claude-B"));
-    assert("prompt: reply convention --to room", prompt.includes("--to room"));
+    // Collision-bug fix: agents reply to the NAMESPACED bus identity, not literal "room".
+    assert("prompt: reply convention --to room-r1", prompt.includes("--to room-r1"));
     assert("prompt: carries thread-id for the room", prompt.includes("r1"));
+  }
+
+  process.stdout.write(`\n${C.BOLD}Room bus namespacing (collision-bug fix)${C.RESET}\n`);
+
+  {
+    // roomBusFor derives "room-<roomId>" — the per-room bus identity that prevents
+    // two hubs from evicting each other on the daemon (the reattach storm).
+    assert("roomBus: room-r1", roomBusFor("r1") === "room-r1");
+    assert("roomBus: room-main", roomBusFor("main") === "room-main");
+    // generateSystemPrompt must emit the namespaced --to target for its room id.
+    const p2 = generateSystemPrompt("a", ["a", "b"], "demo");
+    assert("prompt: --to room-demo for roomId demo", p2.includes("--to room-demo"));
   }
 
   // ── Summary ──────────────────────────────────────────────────────────────
@@ -1610,6 +1655,15 @@ function parseArgs(argv) {
     } else if (a === "--no-agents") {
       opts.agents = [];
     } else if (!a.startsWith("--")) {
+      // roomId must form a valid AgentBus agent name once namespaced as "room-<roomId>".
+      // Reject anything outside [A-Za-z0-9_-] so the derived bus identity is always valid.
+      if (!/^[A-Za-z0-9_-]+$/.test(a)) {
+        process.stderr.write(
+          `Error: invalid room id "${a}". Allowed characters: letters, digits, hyphen, underscore ` +
+          `(it must form a valid agent name when namespaced as "room-${a}").\n`
+        );
+        process.exit(1);
+      }
       opts.roomId = a;
     }
   }
