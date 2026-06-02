@@ -235,7 +235,7 @@ function coalesceLines(lines) {
 // ── Agent Spec Parsing (per-program launch) ───────────────────────────────────
 
 /** Programs the hub knows how to launch. */
-const VALID_PROGRAMS = ["claude", "codex"];
+const VALID_PROGRAMS = ["claude", "codex", "gemini"];
 
 // Agent name validation pattern — prevents shell metacharacter injection via names.
 const AGENT_NAME_RE = /^[A-Za-z0-9_-]+$/;
@@ -275,6 +275,41 @@ function buildCodexConfigToml(trustedDir) {
     `[projects."${trustedDir}"]\n` +
     `trust_level = "trusted"\n`
   );
+}
+
+/**
+ * Build the exact `agentbus run` argv for a GEMINI agent. Pure function — testable.
+ *
+ * VALIDATED GEMINI RECIPE (live-probed — replicate exactly):
+ *   gemini --yolo --skip-trust --allowed-mcp-server-names __none__ -i "<ROOM_PROMPT>"
+ *  - --yolo                          = auto-approve all tools (so it can run `agentbus send`).
+ *  - --skip-trust                    = trust the workspace for the session (no folder-trust modal).
+ *  - --allowed-mcp-server-names __none__ = a DUMMY server name so no real MCP servers load (clean
+ *    fast boot). MUST be the literal "__none__" — an EMPTY string crashes gemini with
+ *    "mcpName is required if specified (cannot be empty)".
+ *  - -i "<ROOM_PROMPT>"              = the room system prompt as the initial interactive prompt
+ *    (gemini reads it, acknowledges, continues interactive). Gemini's trust-establishment, the
+ *    equivalent of Claude's --append-system-prompt-file / Codex's AGENTS.md. Passed as a SINGLE
+ *    argv element (spawn, no shell) so it is never interpolated.
+ *  - RESUME: gemini has NATIVE per-project session resume — `-r latest` resumes the most recent
+ *    session for the cwd/project. On resume we add `-r latest` (no session-id capture needed).
+ *    NOTE: "latest" is per-project, so >1 gemini in the SAME launchDir is ambiguous (best-effort).
+ *  - Runs in the user's cwd = launchDir (spawnRunner sets cwd). NO isolated home / temp files /
+ *    AGENTS.md needed. The agentbus-pty crate has no gemini adapter → the Generic adapter is used
+ *    (intended; do NOT touch the Rust crate).
+ */
+function buildGeminiArgs(busId, transcriptFile, prompt, { resume = false } = {}) {
+  const geminiArgs = resume
+    ? ["gemini", "--yolo", "--skip-trust", "--allowed-mcp-server-names", "__none__", "-r", "latest", "-i", prompt]
+    : ["gemini", "--yolo", "--skip-trust", "--allowed-mcp-server-names", "__none__", "-i", prompt];
+  return [
+    "run",
+    "--name", busId,
+    "--program", "gemini",
+    "--transcript", transcriptFile,
+    "--",
+    ...geminiArgs,
+  ];
 }
 
 // ── Resume / State Persistence (pure path + (de)serialize helpers) ────────────
@@ -783,14 +818,48 @@ function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir
 }
 
 /**
+ * Launch a GEMINI agent with agentbus run.
+ * Returns the SAME uniform shape as the claude/codex paths
+ * ({ child, transcriptFile, spFile, emptyMcp, codexHome, claudeSessionId }) with every
+ * program-specific field null — gemini has NO temp files, NO isolated home, NO session id.
+ * This uniformity means spawnMember's destructure, the resumeInfo bookkeeping, and
+ * teardownChild's guards all just work without special-casing.
+ *
+ * Recipe + flag rationale: see buildGeminiArgs. The room system prompt is delivered as the
+ * `-i` initial interactive prompt (built via the SAME generateSystemPrompt the others use, so
+ * gemini replies `--from <busId> --to <roomBus>` exactly like claude/codex). `resume:true`
+ * adds `-r latest` for gemini's native per-project session resume.
+ */
+function launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false } = {}) {
+  const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
+  const prompt = generateSystemPrompt(agentName, allAgents, roomId);
+  // (A) Register on the bus under the namespaced busId, not the raw display name.
+  const busId = agentBusId(roomId, agentName);
+  const args = buildGeminiArgs(busId, transcriptFile, prompt, { resume });
+
+  printSystemMsg(`Launching gemini agent ${agentName} in ${launchDir}${resume ? " (resuming -r latest)" : ""}...`);
+
+  // No extra env (no isolated home) — runs in the user's cwd (launchDir), same as post-fix codex.
+  const child = spawnRunner(agentName, args, launchDir, null);
+
+  // Uniform null-shape so spawnMember/teardownChild need no gemini special-casing:
+  // no spFile/emptyMcp (claude-only), no codexHome (codex-only), no claudeSessionId.
+  return { child, transcriptFile, spFile: null, emptyMcp: null, codexHome: null, claudeSessionId: null };
+}
+
+/**
  * Per-program launch dispatcher. `resume` carries optional resume handles:
  *   { codex: true }            → relaunch codex via `codex resume --last --all`
+ *   { gemini: true }           → relaunch gemini via `gemini -r latest`
  *   { claudeSessionId: <uuid> } → relaunch claude via `claude --resume <uuid>`
  * Absent/empty → fresh launch. Keeps launchAgents() agnostic of program details.
  */
 function launchAgent(agentName, program, allAgents, roomId, launchDir, transcriptDir, resume = {}) {
   if (program === "codex") {
     return launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.codex });
+  }
+  if (program === "gemini") {
+    return launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.gemini });
   }
   // default + 'claude'
   return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId: resume.claudeSessionId || null });
@@ -1194,7 +1263,7 @@ class RoomHub {
       await this.relay(msg, null);
     }
     if (toFlush.length > 0) {
-      printSystemMsg(`Flushed ${toFlush.length} buffered message(s) that were held by the circuit-breaker`);
+      printSystemMsg(`${C.DIM}caught the agents up — delivered ${toFlush.length} message(s) they sent to each other during the pause (not yours)${C.RESET}`);
     }
   }
 
@@ -1423,7 +1492,7 @@ class RoomHub {
           "  @<agent> <msg>        — address a single agent (Tab completes @names)\n" +
           "  /resume               — unblock circuit-breaker\n" +
           "  /who                  — list members + their programs\n" +
-          "  /add <name>[:program] — add an agent (program = claude|codex; default claude)\n" +
+          "  /add <name>[:program] — add an agent (program = claude|codex|gemini; default claude)\n" +
           "  /kick <name>          — remove an agent from the room\n" +
           "  paste multi-line text — pasted blocks are sent as ONE message (not one per line)\n" +
           "Reconnect (from the shell, after the room is closed):\n" +
@@ -1443,7 +1512,7 @@ class RoomHub {
    */
   cmdAdd(arg) {
     if (!arg) {
-      printSystemMsg("usage: /add <name>[:<program>]   (program = claude|codex; default claude)");
+      printSystemMsg("usage: /add <name>[:<program>]   (program = claude|codex|gemini; default claude)");
       return;
     }
     const spec = parseAgentSpec(arg);
@@ -1804,9 +1873,11 @@ class RoomHub {
         this.programs = {};
         for (const a of loaded.agents) {
           this.programs[a.name] = a.program;
-          // codex → resume:true; claude → restore its pinned session id.
+          // codex → resume:true; gemini → resume:true (`-r latest`); claude → restore its pinned session id.
           resumeHandles[a.name] = a.program === "codex"
             ? { codex: true }
+            : a.program === "gemini"
+            ? { gemini: true }
             : { claudeSessionId: a.claudeSessionId || null };
         }
         printSystemMsg(`Resuming room "${this.roomId}" with ${this.members.length} agent(s): ${this.members.join(", ")}`);
@@ -2115,10 +2186,16 @@ async function runSelfTest() {
     assert("spec codex-A:codex: program", codex.program === "codex");
     assert("spec codex-A:codex: no error", !codex.error);
 
+    // name:gemini accepted (third program)
+    const gemini = parseAgentSpec("gem:gemini");
+    assert("spec gem:gemini: name", gemini.name === "gem");
+    assert("spec gem:gemini: program", gemini.program === "gemini");
+    assert("spec gem:gemini: no error", !gemini.error);
+
     // unknown program rejected
-    const bad = parseAgentSpec("x:gemini");
-    assert("spec x:gemini: rejected with error", typeof bad.error === "string" && bad.error.includes("gemini"));
-    assert("spec x:gemini: no name returned", bad.name === undefined);
+    const bad = parseAgentSpec("x:perl");
+    assert("spec x:perl: rejected with error", typeof bad.error === "string" && bad.error.includes("perl"));
+    assert("spec x:perl: no name returned", bad.name === undefined);
 
     // invalid name rejected (shell metachar)
     const badName = parseAgentSpec("bad name:codex");
@@ -2144,6 +2221,46 @@ async function runSelfTest() {
     assert("codex toml: trust_level trusted", toml.includes('trust_level = "trusted"'));
     // The MCP boot stall is avoided by NOT emitting any [mcp_servers.*] section.
     assert("codex toml: no mcp_servers section", !toml.includes("mcp_servers"));
+  }
+
+  // ── buildGeminiArgs tests (validated recipe) ──────────────────────────────
+
+  process.stdout.write(`\n${C.BOLD}buildGeminiArgs (validated recipe)${C.RESET}\n`);
+
+  {
+    const busId = "r1-gem";
+    const transcript = "/tmp/room-transcript-gem-r1.txt";
+    const prompt = "You are r1-gem. Reply via agentbus send --from r1-gem --to room-r1 ...";
+
+    // Fresh launch
+    const fresh = buildGeminiArgs(busId, transcript, prompt);
+    assert("gemini args: starts with run", fresh[0] === "run");
+    assert("gemini args: --name busId", fresh.includes("--name") && fresh[fresh.indexOf("--name") + 1] === busId);
+    assert("gemini args: --program gemini", fresh[fresh.indexOf("--program") + 1] === "gemini");
+    assert("gemini args: --transcript present", fresh[fresh.indexOf("--transcript") + 1] === transcript);
+    assert("gemini args: has -- separator before gemini", fresh.includes("--") && fresh[fresh.indexOf("--") + 1] === "gemini");
+    assert("gemini args: --yolo present", fresh.includes("--yolo"));
+    assert("gemini args: --skip-trust present", fresh.includes("--skip-trust"));
+    // CRITICAL: the literal "__none__" dummy server name (NOT an empty string — gemini crashes on empty).
+    const mcpIdx = fresh.indexOf("--allowed-mcp-server-names");
+    assert("gemini args: --allowed-mcp-server-names present", mcpIdx !== -1);
+    assert("gemini args: dummy mcp name is literal __none__", fresh[mcpIdx + 1] === "__none__");
+    assert("gemini args: dummy mcp name is NOT empty string", fresh[mcpIdx + 1] !== "");
+    // Prompt delivered as the -i initial interactive prompt, as a SINGLE verbatim argv element.
+    const iIdx = fresh.indexOf("-i");
+    assert("gemini args: -i present", iIdx !== -1);
+    assert("gemini args: prompt is verbatim argv element after -i", fresh[iIdx + 1] === prompt);
+    assert("gemini args: prompt is the last arg", fresh[fresh.length - 1] === prompt);
+    // Fresh launch must NOT carry a resume flag.
+    assert("gemini args (fresh): no -r resume flag", !fresh.includes("-r"));
+
+    // Resume launch adds `-r latest`
+    const resumed = buildGeminiArgs(busId, transcript, prompt, { resume: true });
+    const rIdx = resumed.indexOf("-r");
+    assert("gemini args (resume): -r present", rIdx !== -1);
+    assert("gemini args (resume): -r latest", resumed[rIdx + 1] === "latest");
+    assert("gemini args (resume): still has __none__ mcp name", resumed[resumed.indexOf("--allowed-mcp-server-names") + 1] === "__none__");
+    assert("gemini args (resume): prompt still last", resumed[resumed.length - 1] === prompt);
   }
 
   // ── Codex AGENTS.md == Claude system prompt (consistency) ─────────────────
@@ -2271,9 +2388,13 @@ async function runSelfTest() {
     assert("/add helper:codex → name", addCodex.name === "helper");
     assert("/add helper:codex → codex", addCodex.program === "codex");
 
+    const addGemini = parseAgentSpec("gem:gemini");
+    assert("/add gem:gemini → name", addGemini.name === "gem");
+    assert("/add gem:gemini → gemini", addGemini.program === "gemini");
+
     // bad program rejected → usage path
-    const addBad = parseAgentSpec("x:gemini");
-    assert("/add x:gemini → error", typeof addBad.error === "string");
+    const addBad = parseAgentSpec("x:perl");
+    assert("/add x:perl → error", typeof addBad.error === "string");
 
     // bad name (shell metachar) rejected
     const addBadName = parseAgentSpec("rm -rf:claude");
@@ -2359,12 +2480,15 @@ async function runSelfTest() {
     assert("deserializeState: null on non-object", deserializeState(null) === null);
     assert("deserializeState: null on missing agents array", deserializeState({ roomId: "r1" }) === null);
     const sanitized = deserializeState({ roomId: "r1", agents: [
-      { name: "ok", program: "gemini" },          // unknown program → coerced to claude
+      { name: "ok", program: "bogus" },           // unknown program → coerced to claude
       { name: "bad name", program: "claude" },      // invalid name → dropped
       { name: "x", program: "codex" },
     ]});
     assert("deserializeState: drops invalid-name agent", sanitized.agents.length === 2);
     assert("deserializeState: coerces unknown program to claude", sanitized.agents[0].program === "claude");
+    // gemini is now a VALID program → preserved, not coerced.
+    const gem = deserializeState({ roomId: "r1", agents: [{ name: "g", program: "gemini" }] });
+    assert("deserializeState: preserves gemini program", gem.agents[0].program === "gemini");
 
     // buildReplaySql: tail-capped, DESC, excludes roomBus relay copies, escapes quotes.
     const sql = buildReplaySql("r1", "room-r1", 150);
@@ -2457,7 +2581,7 @@ async function main() {
   if (!opts.roomId) {
     process.stderr.write(
       "Usage: agentbus-room.mjs <room-id> [--agents name[:program],...] [--cb-max 6] [--launch-dir <dir>] [--no-agents] [--resume]\n" +
-      "       --agents accepts `name:program` (program = claude|codex); a bare name defaults to claude.\n" +
+      "       --agents accepts `name:program` (program = claude|codex|gemini); a bare name defaults to claude.\n" +
       "       e.g. --agents claude-A,codex-A:codex\n" +
       "       --resume    reconnect to a closed room: replay history + restore each agent's session\n" +
       "       --no-agents attach to agents already running (hub-died-but-agents-survived reconnect)\n" +

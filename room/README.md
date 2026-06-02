@@ -62,7 +62,7 @@ agentbus-room <room-id> [options]
 
 | Option | Default | Meaning |
 |--------|---------|---------|
-| `--agents <list>` | `claude-A,codex-A:codex` | Comma list of `name[:program]`. Program is `claude` (default) or `codex`. |
+| `--agents <list>` | `claude-A,codex-A:codex` | Comma list of `name[:program]`. Program is `claude` (default), `codex`, or `gemini`. |
 | `--launch-dir <dir>` | current dir | Working directory the agents run in (must be trusted). |
 | `--cb-max <n>` | `6` | Circuit-breaker: pause after N consecutive agent messages with no human input. |
 | `--no-agents` | off | Don't launch agents — attach to ones already running via `agentbus run`. The lightweight "hub died but agents survived" reconnect. |
@@ -72,6 +72,7 @@ agentbus-room <room-id> [options]
 ```sh
 agentbus-room standup --agents pm:claude,eng:codex,qa:claude   # 3 agents, mixed
 agentbus-room review  --agents claude-A,codex-A:codex --cb-max 10
+agentbus-room tri     --agents claude-A,codex-A:codex,gem:gemini   # all three vendors
 ```
 
 **Agents run in _your_ working directory.** Both Claude and Codex launch with their working
@@ -98,6 +99,7 @@ How `--resume` restores each agent:
 - **State file** — every room persists `{ roomId, updatedAt, agents:[{name, program, codexHome?, claudeSessionId?}] }` to `<AGENTBUS_DIR or ~/.agentbus>/rooms/<id>.json` on launch, `/add`, `/kick`, and shutdown.
 - **Codex** — runs under a **stable** per-(room, agent) `CODEX_HOME` (under `…/rooms/<id>/codex-<name>/`, not tmp), so its sessions persist. `--resume` relaunches `codex resume --last --all` in that home. The home is **kept** on normal shutdown (so resume works) and deleted only on `/kick`.
 - **Claude** — each agent is launched with a pinned `--session-id <uuid>` (minted by the hub) which is stored in the state file; `--resume` relaunches `claude --resume <uuid>`.
+- **Gemini** — has **native** per-project session resume: `--resume` relaunches `gemini -r latest`, which restores the most recent session for the launch dir. No session id is captured (unlike Claude) and no extra state is stored beyond `{name, program:"gemini"}`. **Caveat:** `latest` is **per-project (cwd)**, so running **more than one** Gemini agent in the **same** launch dir makes resume ambiguous — it's best-effort there.
 - On `--resume`, agents are **not** re-seeded — they restore their own context from their session, so re-seeding is skipped to avoid fighting that.
 - Without `--resume`, behavior is unchanged: fresh agents, render from now, and the codex home (still stable) simply starts a new session.
 
@@ -167,6 +169,7 @@ hub is the **broadcast/relay layer** AgentBus doesn't provide — an IRC-server 
 ### Agent launch recipes
 - **Claude** — `agentbus run --name <id>-<name> -- claude --dangerously-skip-permissions --strict-mcp-config --mcp-config <empty> --append-system-prompt-file <prompt> --session-id <uuid>`. MCP is disabled for a fast, clean boot. The pinned `--session-id` lets `--resume` relaunch `claude --resume <uuid>`.
 - **Codex** — `agentbus run --name <id>-<name> -- codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --cd <launchDir>` under a **stable isolated `CODEX_HOME`** (under `…/rooms/<id>/codex-<name>/`; auth symlinked from `~/.codex`; a minimal `config.toml` pre-trusts **your launch dir** and omits MCP servers so there's no folder-trust modal and no heavy MCP boot). The room prompt is delivered via `<CODEX_HOME>/AGENTS.md` (global instructions) so the user's repo is never polluted. `--resume` relaunches `codex resume --last --all` in that same home.
+- **Gemini** — `agentbus run --name <id>-<name> -- gemini --yolo --skip-trust --allowed-mcp-server-names __none__ -i "<room prompt>"`. `--yolo` auto-approves all tools (so it can run `agentbus send`); `--skip-trust` trusts the workspace for the session (no folder-trust modal); `--allowed-mcp-server-names __none__` is a **dummy** server name so **no real MCP servers load** (clean fast boot) — it must be the literal `__none__`, never an empty string (Gemini crashes on empty). The room prompt is delivered as the `-i` initial interactive prompt (Gemini's trust-establishment, equivalent to Claude's `--append-system-prompt-file` / Codex's `AGENTS.md`). Runs in your launch dir with **no isolated home and no temp files**. Gemini has no agentbus-pty adapter, so it uses the **Generic adapter** (intended). `--resume` relaunches with `-r latest` (native per-project resume; ambiguous if >1 gemini shares a launch dir).
 
 Add a program by writing a `launch<X>Agent` and extending `parseAgentSpec`'s `VALID_PROGRAMS`.
 
