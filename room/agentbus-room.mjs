@@ -370,7 +370,10 @@ function launchAgent(agentName, allAgents, roomId, launchDir, transcriptDir) {
 
   const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
   const emptyMcp = path.join(os.tmpdir(), `empty-mcp-${roomId}.json`);
-  if (!fs.existsSync(emptyMcp)) fs.writeFileSync(emptyMcp, "{}");
+  // Must be {"mcpServers":{}} — a bare {} fails `--strict-mcp-config` with
+  // "Invalid MCP configuration: mcpServers: expected record, received undefined"
+  // and the agent exits 1 at launch.
+  if (!fs.existsSync(emptyMcp)) fs.writeFileSync(emptyMcp, '{"mcpServers":{}}');
 
   const args = [
     "run",
@@ -443,7 +446,7 @@ async function waitForAgentRegistered(agentName, timeoutMs = 60000) {
  * Wait for agent transcript to show idle prompt (output quiescence for ~2s).
  * Falls back to simple timeout if transcript file not available.
  */
-async function waitForAgentReady(transcriptFile, agentName, timeoutMs = 60000) {
+async function waitForAgentReady(transcriptFile, agentName, timeoutMs = 60000, child = null) {
   printSystemMsg(`Waiting for ${agentName} to be ready...`);
   const deadline = Date.now() + timeoutMs;
   let lastSize = -1;
@@ -451,6 +454,8 @@ async function waitForAgentReady(transcriptFile, agentName, timeoutMs = 60000) {
 
   while (Date.now() < deadline) {
     await sleep(1500);
+    // A dead child's transcript is trivially "idle" — never mistake death for readiness.
+    if (child && child.exitCode !== null) return false;
     try {
       const stat = fs.statSync(transcriptFile);
       const size = stat.size;
@@ -932,15 +937,26 @@ class RoomHub {
       this.children.push({ child, spFile, agentName, transcriptFile, emptyMcp });
     }
 
-    // Wait for all agents to register
+    // Wait for all agents to register + become ready, detecting dead children.
     printSystemMsg("Waiting for agents to register on the bus...");
-    for (const { agentName, transcriptFile } of this.children) {
+    for (const { agentName, transcriptFile, child } of this.children) {
+      if (child.exitCode !== null) {
+        printError(`${agentName} exited (code ${child.exitCode}) at launch — check its transcript: ${transcriptFile}. Not seeding it.`);
+        continue;
+      }
       const registered = await waitForAgentRegistered(agentName, 60000);
       if (!registered) {
         printSystemMsg(`WARNING: ${agentName} did not register within timeout`);
       }
-      await waitForAgentReady(transcriptFile, agentName, 60000);
+      const ready = await waitForAgentReady(transcriptFile, agentName, 60000, child);
+      if (!ready || child.exitCode !== null) {
+        printError(`${agentName} exited (code ${child.exitCode}) before becoming ready — check transcript: ${transcriptFile}. Not seeding it.`);
+        continue;
+      }
       printSystemMsg(`${agentName} ready`);
+    }
+    if (this.members.length === 0) {
+      printError(`No agents are alive — the room has no participants. Check agent transcripts in ${os.tmpdir()}.`);
     }
   }
 
