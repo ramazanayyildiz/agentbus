@@ -89,6 +89,33 @@ function roomBusFor(roomId) {
 }
 
 /**
+ * (A) Per-agent bus namespacing.
+ * Derive an agent's BUS identity from its DISPLAY name. Agents register on the
+ * daemon under this namespaced id so two rooms reusing a display name (e.g.
+ * "claude-A") can't collide — same class of bug as the room-name collision that
+ * roomBusFor fixes. The DISPLAY name (this.members) stays unmangled; we convert
+ * display→busId only at OUTGOING bus boundaries (run --name, send --from/--to).
+ */
+function agentBusId(roomId, name) {
+  return `${roomId}-${name}`;
+}
+
+/**
+ * (A) Inverse of agentBusId for the DISPLAY direction. Strips a leading
+ * "<roomId>-" from a from_agent value so UI shows the friendly name. Applied only
+ * at INCOMING boundaries (live push msg.from, DB-tail from_agent render). The hub's
+ * own roomBus ("room-<roomId>") and any other value are returned UNCHANGED — only
+ * the exact "<roomId>-" prefix is stripped, so "room-r1" is NOT mangled (it doesn't
+ * start with "r1-"). Uses a literal prefix check, not a regex, to stay exact.
+ */
+function displayName(fromAgent, roomId) {
+  if (typeof fromAgent !== "string") return fromAgent;
+  const prefix = `${roomId}-`;
+  if (fromAgent.startsWith(prefix)) return fromAgent.slice(prefix.length);
+  return fromAgent;
+}
+
+/**
  * Parse one newline-terminated line from the AgentBus socket.
  *
  * Returns:
@@ -152,6 +179,26 @@ function computeFanout(msg, members, targetOverride = null) {
     ? members.filter((m) => m === targetOverride && m !== author)
     : members.filter((m) => m !== author);
   return targets.map((to) => ({ to, body }));
+}
+
+/**
+ * (D) Pure @-mention completion. Given the current readline `line` and the member
+ * DISPLAY names, returns { matches, replacement } where:
+ *   - replacement = the trailing "@<partial>" token to be replaced (or null if the line
+ *     does not end in an @-token, meaning "no completion").
+ *   - matches = full "@<name>" strings whose name starts with <partial> (case-insensitive).
+ *     A bare "@" (empty partial) lists ALL members.
+ * The readline `completer` wrapper turns this into Node's [hits, replacementToken] contract.
+ */
+function completeMention(line, members) {
+  // Find the last "@token" at the very end of the line (token = [A-Za-z0-9_-]*).
+  const m = line.match(/@([A-Za-z0-9_-]*)$/);
+  if (!m) return { matches: [], replacement: null };
+  const partial = m[1].toLowerCase();
+  const matches = members
+    .filter((name) => name.toLowerCase().startsWith(partial))
+    .map((name) => `@${name}`);
+  return { matches, replacement: `@${m[1]}` };
 }
 
 // ── Agent Spec Parsing (per-program launch) ───────────────────────────────────
@@ -339,7 +386,9 @@ function renderMessage(msg, roomId) {
     minute: "2-digit",
     second: "2-digit",
   });
-  const author = msg.from_agent || msg.from || "?";
+  // (A) DB-tail rows carry the busId in from_agent; strip "<roomId>-" for display.
+  // roomBus rows are already filtered out by dbTailMessages, so this only sees agents.
+  const author = displayName(msg.from_agent || msg.from || "?", roomId);
   const color = agentColor(author);
   const tag = `${C.DIM}${time}${C.RESET} ${color}${C.BOLD}[${author}]${C.RESET}`;
   const body = msg.body || "";
@@ -407,12 +456,18 @@ function loadTemplate() {
 
 function generateSystemPrompt(selfName, allAgents, roomId) {
   const template = loadTemplate();
+  // (A) The template uses {SELF} for BOTH the roster line AND the load-bearing
+  // `--from {SELF}` reply command. The agent's --from MUST be its busId (replying
+  // under the raw display name would re-introduce the cross-room collision), so
+  // {SELF} = busId here. The friendly "you are <name>" framing is added by the seed
+  // body (seedAgent) instead. Peers stay friendly display names (informational only).
+  const selfBusId = agentBusId(roomId, selfName);
   const peers = allAgents.filter((a) => a !== selfName).join(", ");
   // {ROOM_BUS} = namespaced bus identity ("room-<roomId>"). Agents MUST reply to this,
   // not the literal "room", because the hub registers (and the daemon routes) under it.
   const roomBus = roomBusFor(roomId);
   return template
-    .replace(/{SELF}/g, selfName)
+    .replace(/{SELF}/g, selfBusId)
     .replace(/{PEERS}/g, peers || "(none yet)")
     .replace(/{ROOM_BUS}/g, roomBus)
     .replace(/{ROOM_ID}/g, roomId)
@@ -467,9 +522,11 @@ function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDi
   // and the agent exits 1 at launch.
   if (!fs.existsSync(emptyMcp)) fs.writeFileSync(emptyMcp, '{"mcpServers":{}}');
 
+  // (A) Register on the bus under the namespaced busId, not the raw display name.
+  const busId = agentBusId(roomId, agentName);
   const args = [
     "run",
-    "--name", agentName,
+    "--name", busId,
     "--program", "claude",
     "--transcript", transcriptFile,
     "--",
@@ -531,9 +588,11 @@ function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
   fs.writeFileSync(path.join(workDir, "AGENTS.md"), prompt);
 
+  // (A) Register on the bus under the namespaced busId, not the raw display name.
+  const busId = agentBusId(roomId, agentName);
   const args = [
     "run",
-    "--name", agentName,
+    "--name", busId,
     "--program", "codex",
     "--transcript", transcriptFile,
     "--",
@@ -665,15 +724,18 @@ function ensureDaemonRunning() {
 
 async function seedAgent(agentName, allAgents, roomId) {
   const roomBus = roomBusFor(roomId); // namespaced bus identity for this room
+  const busId = agentBusId(roomId, agentName); // (A) this agent's namespaced bus identity
   const peers = allAgents.filter((a) => a !== agentName).join(" and ");
   const body =
-    `Welcome to room "${roomId}". Your collaborators are: ${peers}, and ram (the human). ` +
+    `Welcome to room "${roomId}". You are ${agentName} (bus id ${busId}). ` +
+    `Your collaborators are: ${peers}, and ram (the human). ` +
     `This is a live conversation relayed over AgentBus. To speak to the room, run: ` +
-    `${AB_PATH} send --from ${agentName} --to ${roomBus} --thread-id ${roomId} --msg-type response "..."  ` +
+    `${AB_PATH} send --from ${busId} --to ${roomBus} --thread-id ${roomId} --msg-type response "..."  ` +
     `Do NOT introduce yourself or send a greeting now — stay silent until a collaborator addresses you or poses a topic, then reply concisely.`;
 
   // H1: await async sendMessage. --from is the namespaced bus identity (NOT literal "room").
-  const result = await sendMessage(roomBus, agentName, body, roomId, "request");
+  // --to targets the agent's busId (the name it registered under), not the display name.
+  const result = await sendMessage(roomBus, busId, body, roomId, "request");
   if (!result.ok) {
     printError(`Failed to seed ${agentName}: ${result.error}`);
   } else {
@@ -710,6 +772,7 @@ class RoomHub {
     this.rl = null; // readline interface for human input
     this.pausedMessages = []; // M4: buffer messages suppressed by circuit-breaker for flush on /resume
     this.working = new Set(); // (C) agents we relayed to but haven't heard back from — drives "is working…"
+    this.launchDir = process.cwd(); // (B) where agents are launched; set for real in run(), reused by /add
   }
 
   // ── Socket Connection ────────────────────────────────────────────────────
@@ -884,8 +947,18 @@ class RoomHub {
   }
 
   async handleIncomingMessage(msg) {
-    // (C) the sender just spoke — it's no longer "working".
-    this.clearWorking(msg.from);
+    // (A) INCOMING BOUNDARY: a live push frame carries the sender's busId in msg.from
+    // (e.g. "r1-claude-A"). Convert it to the DISPLAY name ONCE here, at the top, before
+    // anything downstream touches it. This single normalization makes clearWorking (keyed
+    // by display name), the circuit-breaker, AND computeFanout's self-exclusion all correct:
+    // computeFanout filters members (display names) by `m !== author`, so if author were
+    // a busId the sender would never be excluded → it'd receive its own message (echo loop).
+    // We mutate both from/from_agent so relay()'s computeFanout (which reads either) is safe.
+    const display = displayName(msg.from || msg.from_agent, this.roomId);
+    msg.from = display;
+    if (msg.from_agent) msg.from_agent = display;
+    // (C) the sender just spoke — it's no longer "working" (clearWorking is keyed by display).
+    this.clearWorking(display);
     // Update circuit-breaker
     const tripped = this.cb.recordAgentMessage();
     if (tripped) {
@@ -931,9 +1004,12 @@ class RoomHub {
     // H1: yield between successive relays so socket 'data' events can fire in between.
     for (const { to, body } of fanout) {
       await new Promise((r) => setImmediate(r)); // yield to event loop between relays
+      // (A) OUTGOING BOUNDARY: `to` is a DISPLAY name (computeFanout works on members);
+      // convert to the recipient's busId for the bus --to target, but keep markWorking
+      // keyed by the display name.
       // --from is the namespaced bus identity so relay copies carry from_agent=roomBus
       // (the DB-tail render filter excludes exactly that value to avoid duplicates).
-      const result = await sendMessage(this.roomBus, to, body, this.roomId, "request");
+      const result = await sendMessage(this.roomBus, agentBusId(this.roomId, to), body, this.roomId, "request");
       if (!result.ok) {
         printError(`Relay to ${to} failed: ${result.error}`);
       } else {
@@ -987,6 +1063,13 @@ class RoomHub {
       output: process.stdout,
       prompt: `${C.GREEN}${C.BOLD}ram>${C.RESET} `,
       terminal: true,
+      // (D) Tab-complete @mentions against current member DISPLAY names. Node's contract is
+      // (line) => [hits, replacementToken]; completeMention is the pure core (testable).
+      completer: (line) => {
+        const { matches, replacement } = completeMention(line, this.members);
+        if (replacement === null) return [[], line];
+        return [matches, replacement];
+      },
     });
 
     this.rl.prompt();
@@ -1044,7 +1127,8 @@ class RoomHub {
         this.working.clear(); // (C) fresh human turn — drop stale "working" flags
         for (const to of targets) {
           // Human input is fanned out as if from the room (namespaced bus identity).
-          const result = await sendMessage(this.roomBus, to, prefixedBody, this.roomId, "request");
+          // (A) `to` is a DISPLAY name; target its busId on the bus, keep markWorking display-keyed.
+          const result = await sendMessage(this.roomBus, agentBusId(this.roomId, to), prefixedBody, this.roomId, "request");
           if (!result.ok) {
             printError(`Send to ${to} failed: ${result.error}`);
           } else {
@@ -1085,11 +1169,31 @@ class RoomHub {
       case "/status":
         printSystemMsg(`Room: ${this.roomId} | Members: ${this.members.join(", ")} | CB: ${this.cb.isPaused() ? "PAUSED" : `ok (${this.cb.count()}/${this.cb.maxConsecutive})`}`);
         break;
+      case "/who":
+        // (D) list current members + their programs (display names).
+        if (this.members.length === 0) {
+          printSystemMsg("No agents in the room.");
+        } else {
+          const lines = this.members.map((m) => `  ${m} (${this.programs[m] || "claude"})`).join("\n");
+          printSystemMsg(`Members (${this.members.length}):\n${lines}`);
+        }
+        break;
+      case "/add":
+        // (B) /add <name>[:<program>] — launch + register + seed a new agent at runtime.
+        this.cmdAdd(parts[1]);
+        break;
+      case "/kick":
+        // (B) /kick <name> — kill + clean up + deregister a current member.
+        this.cmdKick(parts[1]);
+        break;
       case "/help":
         printSystemMsg(
-          "Commands: /quit /exit /resume /status /help\n" +
-          "  @<agent> <msg>  — address a single agent\n" +
-          "  /resume         — unblock circuit-breaker"
+          "Commands: /quit /exit /resume /status /who /add /kick /help\n" +
+          "  @<agent> <msg>        — address a single agent (Tab completes @names)\n" +
+          "  /resume               — unblock circuit-breaker\n" +
+          "  /who                  — list members + their programs\n" +
+          "  /add <name>[:program] — add an agent (program = claude|codex; default claude)\n" +
+          "  /kick <name>          — remove an agent from the room"
         );
         break;
       default:
@@ -1097,49 +1201,164 @@ class RoomHub {
     }
   }
 
+  /**
+   * (B) /add <name>[:<program>]. Validates via parseAgentSpec (same name/program rules),
+   * rejects duplicates, then launches+waits+seeds the single agent and registers it in
+   * members/programs/children. Async; errors are surfaced, not thrown into readline.
+   */
+  cmdAdd(arg) {
+    if (!arg) {
+      printSystemMsg("usage: /add <name>[:<program>]   (program = claude|codex; default claude)");
+      return;
+    }
+    const spec = parseAgentSpec(arg);
+    if (spec.error) {
+      printSystemMsg(`usage: /add <name>[:<program>] — ${spec.error}`);
+      return;
+    }
+    const { name, program } = spec;
+    if (this.members.includes(name)) {
+      printSystemMsg(`${name} is already a member.`);
+      return;
+    }
+    // Register bookkeeping BEFORE spawning so the new agent's prompt roster (built from
+    // this.members) and the exit-handler pruning see a consistent member set.
+    this.members.push(name);
+    this.programs[name] = program;
+
+    const doAdd = async () => {
+      // Roster shown to the new agent = the full current member list (display names).
+      const entry = this.spawnMember(name, program, this.launchDir, [...this.members]);
+      const ready = await this.waitMemberReady(entry);
+      if (!ready) {
+        // waitMemberReady already printed why; the exit handler will have pruned members.
+        return;
+      }
+      await seedAgent(name, this.members, this.roomId);
+      printSystemMsg(`Added ${name} (${program})`);
+    };
+    doAdd().catch((e) => {
+      printError(`/add ${name} failed: ${e.message}`);
+      // Roll back the optimistic bookkeeping: if spawnMember threw synchronously (e.g.
+      // fs.writeFileSync EACCES/ENOSPC) there is no child/exit-handler to prune `name`,
+      // and leaving it in members would make every future relay target a dead busId.
+      this.members = this.members.filter((m) => m !== name);
+      delete this.programs[name];
+      this.clearWorking(name);
+    });
+  }
+
+  /**
+   * (B) /kick <name>. If a member: tear down its child (same SIGTERM→3s→SIGKILL recipe as
+   * shutdown), clean its temp files, deregister its busId on the bus, and drop it from
+   * members/programs/children/working. Does NOT touch this.running (room stays up).
+   */
+  cmdKick(name) {
+    if (!name) {
+      printSystemMsg("usage: /kick <name>");
+      return;
+    }
+    if (!this.members.includes(name)) {
+      printSystemMsg(`${name} is not a member.`);
+      return;
+    }
+    const idx = this.children.findIndex((c) => c.agentName === name);
+    const entry = idx !== -1 ? this.children[idx] : null;
+
+    // Drop from the fan-out set immediately so no further relays target it. (The child's
+    // own 'exit' handler also prunes members — harmless double-removal via filter.)
+    this.members = this.members.filter((m) => m !== name);
+    delete this.programs[name];
+    this.clearWorking(name);
+    if (idx !== -1) this.children.splice(idx, 1);
+
+    const doKick = async () => {
+      if (entry) {
+        // unlinkEmptyMcp:false — emptyMcp is a per-room shared file other claude agents use.
+        await this.teardownChild(entry, { unlinkEmptyMcp: false });
+      }
+      // Deregister the agent's busId on the bus (the name it registered under). Killing the
+      // `agentbus run` child already drops its connection; this is an explicit belt-and-braces
+      // close so the daemon's agent row is removed promptly.
+      try {
+        spawnSync(AB_PATH, ["close", "--name", agentBusId(this.roomId, name)], { encoding: "utf8", timeout: 5000 });
+      } catch { /* non-fatal */ }
+      printSystemMsg(`Kicked ${name}`);
+    };
+    doKick().catch((e) => printError(`/kick ${name} failed: ${e.message}`));
+  }
+
   // ── Launch Agents ─────────────────────────────────────────────────────────
+
+  /**
+   * (B) Launch ONE agent: spawn its runner, attach the exit-pruning handler, and push
+   * a children entry. Shared by launchAgents() (boot) and /add (in-room). Does NOT wait
+   * for register/ready and does NOT seed — callers drive that (boot batches the waits;
+   * /add waits+seeds the single agent). `rosterForPrompt` is the agent list shown to the
+   * launched agent in its system prompt (display names).
+   * Returns the children entry just pushed.
+   */
+  spawnMember(agentName, program, launchDir, rosterForPrompt) {
+    const { child, spFile, transcriptFile, emptyMcp, codexHome, workDir } = launchAgent(
+      agentName,
+      program,
+      rosterForPrompt,
+      this.roomId,
+      launchDir,
+      os.tmpdir()
+    );
+    // M3: attach exit handler here where 'this' is bound, so dead agents are pruned
+    // from the fan-out member list immediately (prevents relaying to dead agents).
+    // (A) prune by DISPLAY name (this.members holds display names).
+    child.on("exit", (code, signal) => {
+      const how = code !== null ? `code ${code}` : `signal ${signal || "SIGKILL"}`;
+      printSystemMsg(`Agent ${agentName} exited (${how}) — removed from fan-out`);
+      this.members = this.members.filter((m) => m !== agentName);
+      this.clearWorking(agentName); // drop any stale "working" flag
+    });
+    // codexHome/workDir are undefined for claude agents — harmless in shutdown (guarded).
+    const entry = { child, spFile, agentName, transcriptFile, emptyMcp, codexHome, workDir };
+    this.children.push(entry);
+    return entry;
+  }
+
+  /**
+   * (B) Wait for one already-spawned child to register + become ready. Returns true if
+   * the agent is alive and ready to be seeded, false if it died. Pure orchestration over
+   * the existing wait helpers — shared by boot and /add.
+   * (A) registration is checked against the agent's busId (the name it registered under).
+   */
+  async waitMemberReady(entry) {
+    const { agentName, transcriptFile, child } = entry;
+    if (child.exitCode !== null) {
+      printError(`${agentName} exited (code ${child.exitCode}) at launch — check its transcript: ${transcriptFile}. Not seeding it.`);
+      return false;
+    }
+    const registered = await waitForAgentRegistered(agentBusId(this.roomId, agentName), 60000);
+    if (!registered) {
+      printSystemMsg(`WARNING: ${agentName} did not register within timeout`);
+    }
+    const ready = await waitForAgentReady(transcriptFile, agentName, 60000, child);
+    if (!ready || child.exitCode !== null) {
+      printError(`${agentName} exited (code ${child.exitCode}) before becoming ready — check transcript: ${transcriptFile}. Not seeding it.`);
+      return false;
+    }
+    printSystemMsg(`${agentName} ready`);
+    return true;
+  }
 
   async launchAgents(launchDir) {
     const allAgentNames = [...this.members];
 
     for (const agentName of this.members) {
       const program = this.programs[agentName] || "claude";
-      const { child, spFile, transcriptFile, emptyMcp, codexHome, workDir } = launchAgent(
-        agentName,
-        program,
-        allAgentNames,
-        this.roomId,
-        launchDir,
-        os.tmpdir()
-      );
-      // M3: attach exit handler here where 'this' is bound, so dead agents are pruned
-      // from the fan-out member list immediately (prevents relaying to dead agents).
-      child.on("exit", (code, signal) => {
-        const how = code !== null ? `code ${code}` : `signal ${signal || "SIGKILL"}`;
-        printSystemMsg(`Agent ${agentName} exited (${how}) — removed from fan-out`);
-        this.members = this.members.filter((m) => m !== agentName);
-      });
-      // codexHome/workDir are undefined for claude agents — harmless in shutdown (guarded).
-      this.children.push({ child, spFile, agentName, transcriptFile, emptyMcp, codexHome, workDir });
+      this.spawnMember(agentName, program, launchDir, allAgentNames);
     }
 
     // Wait for all agents to register + become ready, detecting dead children.
     printSystemMsg("Waiting for agents to register on the bus...");
-    for (const { agentName, transcriptFile, child } of this.children) {
-      if (child.exitCode !== null) {
-        printError(`${agentName} exited (code ${child.exitCode}) at launch — check its transcript: ${transcriptFile}. Not seeding it.`);
-        continue;
-      }
-      const registered = await waitForAgentRegistered(agentName, 60000);
-      if (!registered) {
-        printSystemMsg(`WARNING: ${agentName} did not register within timeout`);
-      }
-      const ready = await waitForAgentReady(transcriptFile, agentName, 60000, child);
-      if (!ready || child.exitCode !== null) {
-        printError(`${agentName} exited (code ${child.exitCode}) before becoming ready — check transcript: ${transcriptFile}. Not seeding it.`);
-        continue;
-      }
-      printSystemMsg(`${agentName} ready`);
+    for (const entry of this.children) {
+      await this.waitMemberReady(entry);
     }
     if (this.members.length === 0) {
       printError(`No agents are alive — the room has no participants. Check agent transcripts in ${os.tmpdir()}.`);
@@ -1156,6 +1375,52 @@ class RoomHub {
 
   // ── Teardown ──────────────────────────────────────────────────────────────
 
+  /**
+   * (B) Tear down ONE agent's child + temp files. Factored out of shutdown so /kick can
+   * reuse the EXACT same kill recipe (SIGTERM → 3s → SIGKILL on the process group).
+   * Returns a Promise that resolves once the child has exited and its temp files are cleaned.
+   * H2/H3 semantics preserved. `unlinkEmptyMcp` defaults true (full shutdown); /kick passes
+   * false because emptyMcp is a per-ROOM shared file (empty-mcp-<roomId>.json) that surviving
+   * claude agents may still reference — it's recreated by the existsSync guard on next /add.
+   */
+  teardownChild({ child, agentName, spFile, emptyMcp, codexHome, workDir }, { unlinkEmptyMcp = true } = {}) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+
+      // Try killing the whole process group via negative pid (requires detached:true on spawn)
+      try {
+        process.kill(-child.pid, "SIGTERM");
+      } catch {
+        // If process group kill fails, fall back to killing just the direct child
+        try { child.kill("SIGTERM"); } catch {}
+      }
+
+      child.once("exit", finish);
+
+      // If not exited in 3s, send SIGKILL to the group
+      const killer = setTimeout(() => {
+        printSystemMsg(`${agentName} did not exit in 3s after SIGTERM — sending SIGKILL`);
+        try { process.kill(-child.pid, "SIGKILL"); } catch {
+          try { child.kill("SIGKILL"); } catch {}
+        }
+        finish();
+      }, 3000);
+
+      child.once("exit", () => clearTimeout(killer));
+    }).then(() => {
+      printSystemMsg(`Killed ${agentName}`);
+      // H3: cleanup claude temp files (no-op/guarded when null for codex).
+      try { if (spFile && fs.existsSync(spFile)) fs.unlinkSync(spFile); } catch {}
+      if (unlinkEmptyMcp) {
+        try { if (emptyMcp && fs.existsSync(emptyMcp)) fs.unlinkSync(emptyMcp); } catch {}
+      }
+      // Codex teardown: remove the per-agent isolated CODEX_HOME and WORKDIR.
+      try { if (codexHome && fs.existsSync(codexHome)) fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
+      try { if (workDir && fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
+    });
+  }
+
   async shutdown(reason = "shutdown") {
     if (!this.running) return;
     this.running = false;
@@ -1166,41 +1431,7 @@ class RoomHub {
     // H2: kill each agent's entire process group (SIGTERM → 3s wait → SIGKILL) so the
     // inner program (claude/codex) doesn't survive detached.
     // H3: unlink both spFile and emptyMcp temp files (claude); rm codexHome/workDir (codex).
-    const killPromises = this.children.map(({ child, agentName, spFile, emptyMcp, codexHome, workDir }) => {
-      return new Promise((resolve) => {
-        let done = false;
-        const finish = () => { if (!done) { done = true; resolve(); } };
-
-        // Try killing the whole process group via negative pid (requires detached:true on spawn)
-        try {
-          process.kill(-child.pid, "SIGTERM");
-        } catch {
-          // If process group kill fails, fall back to killing just the direct child
-          try { child.kill("SIGTERM"); } catch {}
-        }
-
-        child.once("exit", finish);
-
-        // If not exited in 3s, send SIGKILL to the group
-        const killer = setTimeout(() => {
-          printSystemMsg(`${agentName} did not exit in 3s after SIGTERM — sending SIGKILL`);
-          try { process.kill(-child.pid, "SIGKILL"); } catch {
-            try { child.kill("SIGKILL"); } catch {}
-          }
-          finish();
-        }, 3000);
-
-        child.once("exit", () => clearTimeout(killer));
-      }).then(() => {
-        printSystemMsg(`Killed ${agentName}`);
-        // H3: cleanup claude temp files (no-op/guarded when null for codex).
-        try { if (spFile && fs.existsSync(spFile)) fs.unlinkSync(spFile); } catch {}
-        try { if (emptyMcp && fs.existsSync(emptyMcp)) fs.unlinkSync(emptyMcp); } catch {}
-        // Codex teardown: remove the per-agent isolated CODEX_HOME and WORKDIR.
-        try { if (codexHome && fs.existsSync(codexHome)) fs.rmSync(codexHome, { recursive: true, force: true }); } catch {}
-        try { if (workDir && fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true }); } catch {}
-      });
-    });
+    const killPromises = this.children.map((entry) => this.teardownChild(entry));
 
     await Promise.all(killPromises);
 
@@ -1251,6 +1482,7 @@ class RoomHub {
   // ── Run ───────────────────────────────────────────────────────────────────
 
   async run(launchDir) {
+    this.launchDir = launchDir; // (B) remember for runtime /add
     // 1. Ensure daemon
     if (!ensureDaemonRunning()) {
       process.exit(1);
@@ -1621,6 +1853,119 @@ async function runSelfTest() {
     // generateSystemPrompt must emit the namespaced --to target for its room id.
     const p2 = generateSystemPrompt("a", ["a", "b"], "demo");
     assert("prompt: --to room-demo for roomId demo", p2.includes("--to room-demo"));
+  }
+
+  // ── (A) agentBusId + displayName (per-agent bus namespacing) ───────────────
+
+  process.stdout.write(`\n${C.BOLD}(A) agentBusId / displayName${C.RESET}\n`);
+
+  {
+    // busId derivation: "<roomId>-<name>"
+    assert("agentBusId r1+claude-A", agentBusId("r1", "claude-A") === "r1-claude-A");
+    assert("agentBusId demo+codex-A", agentBusId("demo", "codex-A") === "demo-codex-A");
+
+    // displayName strips exactly the "<roomId>-" prefix
+    assert("displayName strips r1- prefix", displayName("r1-claude-A", "r1") === "claude-A");
+    assert("displayName strips demo- prefix", displayName("demo-codex-A", "demo") === "codex-A");
+    // round-trip: display → bus → display
+    assert("agentBusId/displayName round-trip", displayName(agentBusId("r1", "claude-B"), "r1") === "claude-B");
+
+    // CRITICAL: the hub's own roomBus must NOT be mangled (it doesn't start with "<roomId>-").
+    assert("displayName leaves room-r1 unmangled", displayName("room-r1", "r1") === "room-r1");
+    assert("displayName leaves room-demo unmangled", displayName("room-demo", "demo") === "room-demo");
+    // ram and other non-prefixed values pass through unchanged.
+    assert("displayName leaves ram unchanged", displayName("ram", "r1") === "ram");
+    assert("displayName leaves non-prefixed unchanged", displayName("claude-A", "r1") === "claude-A");
+    // Only strips a LEADING prefix, not a mid-string occurrence.
+    assert("displayName only strips leading prefix", displayName("x-r1-claude", "r1") === "x-r1-claude");
+    // Non-string input passes through (defensive).
+    assert("displayName passes through non-string", displayName(undefined, "r1") === undefined);
+  }
+
+  // generateSystemPrompt now emits the agent's BUS ID in the load-bearing --from line.
+  process.stdout.write(`\n${C.BOLD}(A) prompt --from uses busId${C.RESET}\n`);
+
+  {
+    const prompt = generateSystemPrompt("claude-A", ["claude-A", "codex-B"], "r1");
+    // The reply command's --from MUST be the namespaced busId, NOT the raw display name,
+    // or the cross-room collision is re-introduced.
+    assert("prompt --from r1-claude-A (busId)", prompt.includes("--from r1-claude-A"));
+    assert("prompt --to room-r1 (roomBus)", prompt.includes("--to room-r1"));
+    // Peer display name still appears (roster is informational, friendly names ok).
+    assert("prompt names peer display name", prompt.includes("codex-B"));
+  }
+
+  // ── (D) completeMention (@-mention Tab completion, pure core) ──────────────
+
+  process.stdout.write(`\n${C.BOLD}(D) completeMention${C.RESET}\n`);
+
+  {
+    const members = ["claude-A", "claude-B", "codex-A"];
+
+    // "@cl" → both claude-* (prefix match), replacement is the "@cl" token
+    const r1 = completeMention("@cl", members);
+    assert("complete @cl: 2 matches", r1.matches.length === 2);
+    assert("complete @cl: matches are @claude-A/@claude-B", deepEqual(r1.matches, ["@claude-A", "@claude-B"]));
+    assert("complete @cl: replacement is @cl", r1.replacement === "@cl");
+
+    // bare "@" lists ALL members
+    const rAll = completeMention("@", members);
+    assert("complete @ (bare): lists all 3", rAll.matches.length === 3);
+    assert("complete @ (bare): replacement is @", rAll.replacement === "@");
+
+    // "@codex" → single match
+    const rCodex = completeMention("@codex", members);
+    assert("complete @codex: single match", rCodex.matches.length === 1);
+    assert("complete @codex: match is @codex-A", rCodex.matches[0] === "@codex-A");
+
+    // case-insensitive
+    const rUpper = completeMention("@CL", members);
+    assert("complete @CL: case-insensitive 2 matches", rUpper.matches.length === 2);
+
+    // mid-line @token: "hi @cl" completes the trailing token only
+    const rMid = completeMention("hi @cl", members);
+    assert("complete 'hi @cl': replacement is @cl (trailing token)", rMid.replacement === "@cl");
+    assert("complete 'hi @cl': 2 matches", rMid.matches.length === 2);
+
+    // no @-token at the end → no completion (replacement null → wrapper returns [[], line])
+    const rNone = completeMention("hello world", members);
+    assert("complete 'hello world': replacement null", rNone.replacement === null);
+    assert("complete 'hello world': no matches", rNone.matches.length === 0);
+    const rTrailingSpace = completeMention("@claude-A ", members);
+    assert("complete '@claude-A ' (trailing space): replacement null", rTrailingSpace.replacement === null);
+
+    // unknown partial → zero matches but still a valid replacement token
+    const rUnknown = completeMention("@zzz", members);
+    assert("complete @zzz: zero matches", rUnknown.matches.length === 0);
+    assert("complete @zzz: replacement still @zzz", rUnknown.replacement === "@zzz");
+  }
+
+  // ── (B) /add /kick command parsing (pure: reuses parseAgentSpec) ───────────
+
+  process.stdout.write(`\n${C.BOLD}(B) /add /kick spec parsing${C.RESET}\n`);
+
+  {
+    // /add reuses parseAgentSpec for its <name>[:<program>] argument.
+    const addClaude = parseAgentSpec("worker");
+    assert("/add worker → name", addClaude.name === "worker");
+    assert("/add worker → defaults claude", addClaude.program === "claude");
+
+    const addCodex = parseAgentSpec("helper:codex");
+    assert("/add helper:codex → name", addCodex.name === "helper");
+    assert("/add helper:codex → codex", addCodex.program === "codex");
+
+    // bad program rejected → usage path
+    const addBad = parseAgentSpec("x:gemini");
+    assert("/add x:gemini → error", typeof addBad.error === "string");
+
+    // bad name (shell metachar) rejected
+    const addBadName = parseAgentSpec("rm -rf:claude");
+    assert("/add 'rm -rf' → error", typeof addBadName.error === "string" && addBadName.error.includes("invalid agent name"));
+
+    // /kick takes a bare name; the not-a-member check is a simple includes() on display names.
+    const members = ["claude-A", "codex-A"];
+    assert("/kick member check: claude-A is member", members.includes("claude-A"));
+    assert("/kick member check: ghost is NOT member", !members.includes("ghost"));
   }
 
   // ── Summary ──────────────────────────────────────────────────────────────

@@ -26,6 +26,8 @@ IRC-server that makes multi-party rooms work.
 
 - **Rooms are isolated by id:** the hub's bus identity is `room-<roomId>` (not the literal `room`), so multiple hubs can run at once without evicting each other on the daemon. The `[room]` display label is unchanged.
 
+- **Agents are bus-namespaced too:** each agent registers on the bus as `<roomId>-<name>` (e.g. `r1-claude-A`) while its DISPLAY name stays `<name>`. This prevents two rooms reusing a name (e.g. `claude-A`) from colliding on the daemon — the same fix as the room-name namespacing. The hub converts display→busId only at outgoing bus boundaries (`agentbus run --name`, `send --from`/`--to`) and strips the `<roomId>-` prefix back at incoming boundaries (live push `from`, DB-tail `from_agent` render). The hub's own `room-<roomId>` identity is left unmangled.
+
 - Agents always send `--to room`. The hub re-fans as `--from room --to <member>`,
   with the real author in the body (`"claude-A: <text>"`). This ensures agents
   always reply `--to room` naturally and the hub never misses a reply.
@@ -74,13 +76,16 @@ node agentbus-room.mjs --self-test
 
 ## In-room commands
 
-| Command       | Action                                        |
-|---------------|-----------------------------------------------|
-| `/status`     | Show room ID, members, circuit-breaker state  |
-| `/resume`     | Unblock circuit-breaker after auto-pause      |
-| `/help`       | List commands                                 |
-| `/quit`       | Graceful shutdown, kills agent processes      |
-| `@claude-A …` | Narrow input to a single agent               |
+| Command                  | Action                                                          |
+|--------------------------|-----------------------------------------------------------------|
+| `/status`                | Show room ID, members, circuit-breaker state                    |
+| `/who`                   | List current members and their programs                         |
+| `/resume`                | Unblock circuit-breaker after auto-pause                        |
+| `/add <name>[:program]`  | Launch + register + seed a new agent at runtime (claude\|codex) |
+| `/kick <name>`           | Kill + clean up + deregister a member, keeping the room up       |
+| `/help`                  | List commands                                                   |
+| `/quit`                  | Graceful shutdown, kills agent processes                        |
+| `@claude-A …`            | Narrow input to a single agent (`@`+Tab completes member names) |
 
 ## Self-test (no real agents spawned)
 
@@ -94,6 +99,9 @@ Exercises all pure relay logic with fixture data:
 - `computeFanout` — sender exclusion, body prefixing, `@mention` narrowing
 - `CircuitBreaker` — trip at N, reset on human input, re-trip after reset
 - `LineReader` — chunked delivery buffer splitting
+- `agentBusId` / `displayName` — per-agent bus namespacing + prefix-strip (incl. `room-<id>` left unmangled)
+- `completeMention` — `@`+Tab completion (prefix match, bare `@` lists all, trailing-token only)
+- `parseAgentSpec` — `/add` argument parsing (name validation, program whitelist)
 
 Exit code 0 = all pass. Exit code 1 = failures (safe to run in CI with no daemon).
 
