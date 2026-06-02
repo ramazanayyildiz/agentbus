@@ -644,8 +644,9 @@ async function seedAgent(agentName, allAgents, roomId) {
   const peers = allAgents.filter((a) => a !== agentName).join(" and ");
   const body =
     `Welcome to room "${roomId}". Your collaborators are: ${peers}, and ram (the human). ` +
-    `This is a live conversation. Please acknowledge you're ready by sending a brief introduction via: ` +
-    `${AB_PATH} send --from ${agentName} --to room --thread-id ${roomId} --msg-type response "..."`;
+    `This is a live conversation relayed over AgentBus. To speak to the room, run: ` +
+    `${AB_PATH} send --from ${agentName} --to room --thread-id ${roomId} --msg-type response "..."  ` +
+    `Do NOT introduce yourself or send a greeting now — stay silent until a collaborator addresses you or poses a topic, then reply concisely.`;
 
   // H1: await async sendMessage
   const result = await sendMessage("room", agentName, body, roomId, "request");
@@ -1062,8 +1063,9 @@ class RoomHub {
       );
       // M3: attach exit handler here where 'this' is bound, so dead agents are pruned
       // from the fan-out member list immediately (prevents relaying to dead agents).
-      child.on("exit", (code) => {
-        printSystemMsg(`Agent ${agentName} exited (code ${code}) — removed from fan-out`);
+      child.on("exit", (code, signal) => {
+        const how = code !== null ? `code ${code}` : `signal ${signal || "SIGKILL"}`;
+        printSystemMsg(`Agent ${agentName} exited (${how}) — removed from fan-out`);
         this.members = this.members.filter((m) => m !== agentName);
       });
       // codexHome/workDir are undefined for claude agents — harmless in shutdown (guarded).
