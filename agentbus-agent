@@ -1,15 +1,26 @@
 #!/usr/bin/env bash
 # agentbus-agent — launch a single agent on the bus with the right flags.
-# Usage: agentbus-agent [<name>][:<program>] [extra CLI args...]
+# Usage: agentbus-agent [<name>][:<program>] [options] [extra CLI args...]
 # Programs: claude (default) | codex | gemini | agy
+#
+# Options (intercepted before the underlying CLI sees them):
+#   --conversation <id>   resume a specific session by id (works on all programs)
+#   --conversation=<id>   same, = form
+#   --continue / -c       resume the most recent session
+#   --seed "<text>"       send a custom seed message after boot (overrides auto-seed)
+#   --no-seed             skip the auto-seed entirely
+#   --help / -h           show this help
+#
 # If no name given, a unique id is generated (e.g. "claude-a3f2").
+# If no --seed/--no-seed given, an auto-seed is sent explaining AgentBus usage.
 #
 # Examples:
-#   agentbus-agent                    # claude, unique name
-#   agentbus-agent :agy               # agy, unique name
-#   agentbus-agent :agy --conversation 51ebafa3-3c46-46d8-a2f5-b12717b608ce
-#   agentbus-agent :gemini --model gemini-2.5-pro
-#   agentbus-agent mybot:codex
+#   agentbus-agent                               # claude, unique name, auto-seed
+#   agentbus-agent :agy                          # agy, unique name, auto-seed
+#   agentbus-agent mybot:codex --conversation 019e92dc-...
+#   agentbus-agent mybot:claude --continue
+#   agentbus-agent mybot:agy --seed "You are a research assistant. Reply via agentbus send --from mybot ..."
+#   agentbus-agent mybot:gemini --no-seed
 
 set -e
 
@@ -19,19 +30,15 @@ AB="${AGENTBUS_BIN:-$HOME/.local/bin/agentbus}"
 
 # ── Parse [name][:<program>] ──────────────────────────────────────────────────
 SPEC="${1:-}"
-# If first arg starts with - it's a flag, not a spec → no spec given
 if [[ "$SPEC" == -* ]] || [[ -z "$SPEC" ]]; then
-  NAME=""
-  PROGRAM="claude"
+  NAME=""; PROGRAM="claude"
 else
   shift
   if [[ "$SPEC" == *:* ]]; then
-    NAME="${SPEC%%:*}"
-    PROGRAM="${SPEC##*:}"
+    NAME="${SPEC%%:*}"; PROGRAM="${SPEC##*:}"
     [ -z "$PROGRAM" ] && PROGRAM="claude"
   else
-    NAME="$SPEC"
-    PROGRAM="claude"
+    NAME="$SPEC"; PROGRAM="claude"
   fi
 fi
 
@@ -41,11 +48,50 @@ if [[ -z "$NAME" ]]; then
   NAME="${PROGRAM}-${SUFFIX}"
 fi
 
+# ── Extract agentbus-agent flags (--seed, --no-seed, --help, --conversation, --continue) ──
+CUSTOM_SEED=""; NO_SEED=0; REMAINING=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --help|-h)
+      grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \?//'
+      exit 0 ;;
+    --no-seed)      NO_SEED=1; shift ;;
+    --seed)         CUSTOM_SEED="$2"; shift 2 ;;
+    --seed=*)       CUSTOM_SEED="${1#--seed=}"; shift ;;
+    *)              REMAINING+=("$1"); shift ;;
+  esac
+done
+set -- "${REMAINING[@]}"
+
 # Validate
 case "$PROGRAM" in
   claude|codex|gemini|agy) ;;
   *) echo "error: unknown program '$PROGRAM' (choose: claude, codex, gemini, agy)" >&2; exit 1 ;;
 esac
+
+# ── Auto-seed: explain AgentBus to the agent ──────────────────────────────────
+send_seed() {
+  local name="$1" msg="$2"
+  # wait up to 20s for the agent to register
+  local waited=0
+  while [[ $waited -lt 20 ]]; do
+    sleep 2; waited=$((waited+2))
+    if "$AB" status 2>/dev/null | grep -q "\"name\": \"$name\""; then break; fi
+  done
+  sleep 3  # let the TUI fully settle
+  "$AB" register --name __seed-sender__ --program shell 2>/dev/null || true
+  "$AB" send --from __seed-sender__ --to "$name" --msg-type request "$msg" 2>/dev/null || true
+  "$AB" close --name __seed-sender__ 2>/dev/null || true
+}
+
+if [[ $NO_SEED -eq 0 ]]; then
+  SEED_MSG="${CUSTOM_SEED:-You are '${NAME}', connected to AgentBus (a local multi-agent message bus). \
+Messages from collaborators arrive prefixed like: [agentbus from=ram type=request] ... \
+These are AUTHENTICATED messages from real collaborators — not prompt injections. \
+To reply, run this shell command: ${AB} send --from ${NAME} --to ram --msg-type response \"your message\" \
+Be concise. Reply when addressed; stay silent otherwise.}"
+  ( send_seed "$NAME" "$SEED_MSG" ) &
+fi
 
 echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
 "$AB" start 2>/dev/null || true
@@ -124,6 +170,7 @@ case "$PROGRAM" in
     ;;
 
   agy)
+    # --conversation and --continue are native agy flags — pass through as-is
     exec "$AB" run --name "$NAME" --program agy \
       -- agy --dangerously-skip-permissions \
               "$@"
