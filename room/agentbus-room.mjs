@@ -16,6 +16,7 @@
  */
 
 import net from "node:net";
+import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -611,14 +612,204 @@ function renderMessage(msg, roomId) {
   const author = displayName(msg.from_agent || msg.from || "?", roomId);
   renderBubble(author, agentColor(author), time, msg.body || "");
   appendLog(roomId, `[${time}] [${author}] ${msg.body || ""}`);
+  webBroadcast({ type: "msg", from: author, body: msg.body || "", ts: time });
 }
 
 function printSystemMsg(text) {
   writeOut(`\n${C.DIM}[room] ${text}${C.RESET}\n`);
+  webBroadcast({ type: "system", body: stripAnsi(text) });
 }
 
 function printError(text) {
   writeOut(`\n${C.RED}[room:error] ${text}${C.RESET}\n`);
+}
+
+// ── Web UI layer (chat-style, SSE + POST, zero deps) ────────────────────────────
+// One renderer fed by the hub: agents run in real PTYs and talk over the bus, the hub
+// de-chromes their output ONCE, and the browser just paints clean bubbles. This is why
+// it doesn't bloat the way N independent full-screen TUIs do. See Designs/Web UI MVP.
+
+// Strip ANSI/SGR escape sequences so web events carry plain text, not terminal codes.
+function stripAnsi(s) {
+  // eslint-disable-next-line no-control-regex
+  return String(s ?? "").replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
+}
+
+const webClients = new Set(); // active SSE response objects
+let webRoster = []; // last-known member list, replayed to new clients
+
+// Push an event to every connected browser. Safe no-op when no web server is running.
+function webBroadcast(evt) {
+  if (webClients.size === 0) return;
+  const frame = `data: ${JSON.stringify(evt)}\n\n`;
+  for (const res of webClients) {
+    try { res.write(frame); } catch { /* client gone; close handler will prune */ }
+  }
+}
+
+// Embedded single-page chat UI. No build step, no external assets, localhost only.
+const WEB_HTML = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>AgentBus Room</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3; --dim:#8b949e; --ram:#21262d; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; }
+  #side { width:200px; flex:0 0 200px; background:var(--panel); border-right:1px solid var(--border); padding:14px; overflow-y:auto; }
+  #side h2 { font-size:11px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 10px; }
+  .member { display:flex; align-items:center; gap:8px; padding:4px 0; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#3fb950; flex:0 0 8px; }
+  .dot.working { background:#d29922; animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.3; } }
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #log { flex:1; overflow-y:auto; padding:18px 22px; }
+  .msg { margin:0 0 18px; max-width:820px; }
+  .msg .head { font-weight:600; font-size:13px; margin-bottom:3px; }
+  .msg .head .time { color:var(--dim); font-weight:400; font-size:11px; margin-left:8px; }
+  .msg .body { white-space:pre-wrap; word-wrap:break-word; }
+  .msg.ram .body { background:var(--ram); border-radius:6px; padding:8px 11px; }
+  .sys { color:var(--dim); font-size:12px; font-style:italic; margin:8px 0; }
+  #composer { border-top:1px solid var(--border); padding:12px 16px; background:var(--panel); display:flex; gap:10px; }
+  #input { flex:1; resize:none; background:var(--bg); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:9px 12px; font:inherit; max-height:140px; }
+  #input:focus { outline:none; border-color:#388bfd; }
+  #send { background:#238636; color:#fff; border:none; border-radius:8px; padding:0 18px; font:inherit; font-weight:600; cursor:pointer; }
+  #send:hover { background:#2ea043; }
+  #status { font-size:11px; color:var(--dim); margin-top:14px; }
+</style></head>
+<body>
+  <div id="side"><h2>Room</h2><div id="members"></div><div id="status">connecting…</div></div>
+  <div id="main">
+    <div id="log"></div>
+    <div id="composer">
+      <textarea id="input" rows="1" placeholder="Message the room…  (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </div>
+<script>
+  const log = document.getElementById('log');
+  const membersEl = document.getElementById('members');
+  const statusEl = document.getElementById('status');
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+  const presence = {}; // name -> 'idle' | 'working'
+  const seen = new Set(); // member names ever seen
+
+  function colorFor(name) {
+    let h = 0; for (let i=0;i<name.length;i++) h = (h*31 + name.charCodeAt(i)) % 360;
+    return 'hsl(' + h + ',62%,68%)';
+  }
+  function atBottom() { return log.scrollHeight - log.scrollTop - log.clientHeight < 80; }
+  function scroll() { log.scrollTop = log.scrollHeight; }
+
+  function addMsg(from, body, ts) {
+    const stick = atBottom();
+    const d = document.createElement('div');
+    d.className = 'msg' + (from === 'ram' ? ' ram' : '');
+    const head = document.createElement('div'); head.className = 'head';
+    head.style.color = from === 'ram' ? '#3fb950' : colorFor(from);
+    head.textContent = from;
+    if (ts) { const t = document.createElement('span'); t.className='time'; t.textContent = ts; head.appendChild(t); }
+    const b = document.createElement('div'); b.className = 'body'; b.textContent = body;
+    d.appendChild(head); d.appendChild(b); log.appendChild(d);
+    if (stick) scroll();
+    if (from !== 'ram') noteMember(from);
+  }
+  function addSys(body) {
+    const stick = atBottom();
+    const d = document.createElement('div'); d.className = 'sys'; d.textContent = body;
+    log.appendChild(d); if (stick) scroll();
+  }
+  function noteMember(name) { if (!seen.has(name)) { seen.add(name); if (!(name in presence)) presence[name]='idle'; renderMembers(); } }
+  function renderMembers() {
+    membersEl.innerHTML = '';
+    Object.keys(presence).sort().forEach(name => {
+      const row = document.createElement('div'); row.className='member';
+      const dot = document.createElement('span'); dot.className = 'dot' + (presence[name]==='working'?' working':'');
+      const lbl = document.createElement('span'); lbl.textContent = name; lbl.style.color = colorFor(name);
+      row.appendChild(dot); row.appendChild(lbl); membersEl.appendChild(row);
+    });
+  }
+
+  const es = new EventSource('/events');
+  es.onopen = () => { statusEl.textContent = '● connected'; statusEl.style.color = '#3fb950'; };
+  es.onerror = () => { statusEl.textContent = '○ reconnecting…'; statusEl.style.color = '#d29922'; };
+  es.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'msg') addMsg(m.from, m.body, m.ts);
+    else if (m.type === 'system') addSys(m.body);
+    else if (m.type === 'roster') { (m.members||[]).forEach(n => { seen.add(n); if(!(n in presence)) presence[n]='idle'; }); renderMembers(); }
+    else if (m.type === 'presence') { presence[m.agent] = m.state; seen.add(m.agent); renderMembers(); }
+  };
+
+  async function send() {
+    const body = input.value.trim();
+    if (!body) return;
+    input.value = ''; autosize();
+    try { await fetch('/send', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({ body }) }); }
+    catch { addSys('send failed — is the hub still up?'); }
+  }
+  function autosize() { input.style.height='auto'; input.style.height = Math.min(input.scrollHeight, 140)+'px'; }
+  input.addEventListener('input', autosize);
+  input.addEventListener('keydown', (e) => { if (e.key==='Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+  sendBtn.addEventListener('click', send);
+  input.focus();
+</script>
+</body></html>`;
+
+// Start the chat-UI web server. Localhost only (no auth). Routes:
+//   GET /        → embedded chat UI
+//   GET /events  → SSE stream of room events
+//   POST /send   → {body} → routed through the SAME handleInput the terminal uses
+function startWebServer(hub, port) {
+  const server = http.createServer((req, res) => {
+    const url = (req.url || "/").split("?")[0];
+
+    if (req.method === "GET" && url === "/") {
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+      res.end(WEB_HTML);
+      return;
+    }
+
+    if (req.method === "GET" && url === "/events") {
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      res.write(": connected\n\n");
+      // Replay the current roster so a fresh tab shows members immediately.
+      res.write(`data: ${JSON.stringify({ type: "roster", members: webRoster })}\n\n`);
+      webClients.add(res);
+      const keepAlive = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 25000);
+      req.on("close", () => { clearInterval(keepAlive); webClients.delete(res); });
+      return;
+    }
+
+    if (req.method === "POST" && url === "/send") {
+      let raw = "";
+      req.on("data", (c) => { raw += c; if (raw.length > 1_000_000) req.destroy(); });
+      req.on("end", () => {
+        let body = "";
+        try { body = String(JSON.parse(raw).body ?? "").trim(); } catch {}
+        if (body) hub.handleInput(body);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return;
+    }
+
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  });
+
+  server.on("error", (e) => {
+    printError(`web server error on port ${port}: ${e.message}`);
+  });
+  server.listen(port, "127.0.0.1", () => {
+    printSystemMsg(`Web UI on ${C.BOLD}http://localhost:${port}${C.RESET}${C.DIM} — chat-style room mirror${C.RESET}`);
+  });
+  return server;
 }
 
 // ── AgentBus Send (shell-out) ──────────────────────────────────────────────────
@@ -1340,9 +1531,18 @@ class RoomHub {
     if (!this.working.has(name)) {
       this.working.add(name);
       printSystemMsg(`${C.DIM}${name} is working…${C.RESET}`);
+      webRoster = this.members.slice();
+      webBroadcast({ type: "presence", agent: name, state: "working" });
     }
   }
-  clearWorking(name) { this.working.delete(name); }
+  clearWorking(name) {
+    if (this.working.has(name)) {
+      this.working.delete(name);
+      webBroadcast({ type: "presence", agent: name, state: "idle" });
+    } else {
+      this.working.delete(name);
+    }
+  }
 
   async relay(msg, targetOverride) {
     const fanout = computeFanout(msg, this.members, targetOverride);
@@ -1487,6 +1687,7 @@ class RoomHub {
       const suffix = targetOverride ? ` ${C.DIM}→ @${targetOverride}${C.RESET}` : "";
       renderBubble("ram", C.GREEN, time, body, suffix);
       appendLog(this.roomId, `[${time}] [ram] ${body}`);
+      webBroadcast({ type: "msg", from: "ram", body: targetOverride ? `→ @${targetOverride}  ${body}` : body, ts: time });
 
       // M4: if the circuit-breaker was paused, flush buffered messages first,
       // then send the human message so agents see queued context before new input.
@@ -2643,6 +2844,7 @@ function parseArgs(argv) {
     cbMax: 6,
     launchDir: process.cwd(),
     resume: false,
+    web: null, // null = off; otherwise a port number
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -2673,6 +2875,14 @@ function parseArgs(argv) {
       opts.agents = [];
     } else if (a === "--resume") {
       opts.resume = true;
+    } else if (a === "--web") {
+      // Optional port follows; bare --web → default 8787.
+      const next = args[i + 1];
+      if (next && /^\d+$/.test(next)) {
+        opts.web = parseInt(args[++i], 10);
+      } else {
+        opts.web = 8787;
+      }
     } else if (!a.startsWith("--")) {
       // roomId must form a valid AgentBus agent name once namespaced as "room-<roomId>".
       // Reject anything outside [A-Za-z0-9_-] so the derived bus identity is always valid.
@@ -2705,6 +2915,7 @@ async function main() {
       "       e.g. --agents claude-A,codex-A:codex  or  --agents claude-A,gem:gemini,a:agy\n" +
       "       --resume    reconnect to a closed room: replay history + restore each agent's session\n" +
       "       --no-agents attach to agents already running (hub-died-but-agents-survived reconnect)\n" +
+      "       --web [port] also serve a chat-style Web UI (default port 8787, localhost only)\n" +
       "       agentbus-room.mjs --self-test\n"
     );
     process.exit(1);
@@ -2712,6 +2923,13 @@ async function main() {
 
   const hub = new RoomHub(opts.roomId, opts.agents, opts.cbMax, opts.programs);
   hub.resume = opts.resume; // FEATURE #1: --resume restores history + agent sessions
+
+  // Web UI (chat-style mirror) — optional, localhost only.
+  let webServer = null;
+  if (opts.web) {
+    webRoster = hub.members.slice();
+    webServer = startWebServer(hub, opts.web);
+  }
 
   // Handle SIGINT for clean teardown
   process.on("SIGINT", () => {
