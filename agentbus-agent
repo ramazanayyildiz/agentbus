@@ -7,26 +7,52 @@
 #   --conversation <id>   resume a specific session by id (works on all programs)
 #   --conversation=<id>   same, = form
 #   --continue / -c       resume the most recent session
+#   --detach / -d         run in a background tmux session (NOT rendered in your terminal,
+#                         so it won't bloat Warp). Re-attach later with --attach.
 #   --seed "<text>"       send a custom seed message after boot (overrides auto-seed)
 #   --no-seed             skip the auto-seed entirely
+#   --list / -l           list resumable sessions and pick one
 #   --help / -h           show this help
+#
+# Detach control (no spec needed):
+#   agentbus-agent --attach <name>    re-attach to a detached agent's live TUI (Ctrl-b d to detach again)
+#   agentbus-agent --kill <name>      stop a detached agent + close it on the bus
+#   agentbus-agent --detached         list all detached agentbus-agent tmux sessions
 #
 # If no name given, a unique id is generated (e.g. "claude-a3f2").
 # If no --seed/--no-seed given, an auto-seed is sent explaining AgentBus usage.
 #
 # Examples:
-#   agentbus-agent                               # claude, unique name, auto-seed
-#   agentbus-agent :agy                          # agy, unique name, auto-seed
+#   agentbus-agent                               # claude, foreground, unique name
 #   agentbus-agent mybot:codex --conversation 019e92dc-...
-#   agentbus-agent mybot:claude --continue
-#   agentbus-agent mybot:agy --seed "You are a research assistant. Reply via agentbus send --from mybot ..."
-#   agentbus-agent mybot:gemini --no-seed
+#   agentbus-agent mybot:agy --detach            # background tmux, won't bloat Warp
+#   agentbus-agent --attach mybot                # bring its live TUI back
+#   agentbus-agent --kill mybot
 
 set -e
 
 AB="${AGENTBUS_BIN:-$HOME/.local/bin/agentbus}"
 [ -x "$AB" ] || AB="$HOME/.cargo/bin/agentbus"
 [ -x "$AB" ] || { echo "error: agentbus not found (set AGENTBUS_BIN or put it in ~/.local/bin)" >&2; exit 1; }
+
+sess_name() { echo "agentbus-${1%%:*}"; }  # strip :program if present
+
+# ── Detach control modes (handled before normal launch) ───────────────────────
+case "${1:-}" in
+  --attach|-a)
+    [ -z "${2:-}" ] && { echo "usage: agentbus-agent --attach <name>" >&2; exit 1; }
+    exec tmux attach -t "$(sess_name "$2")" ;;
+  --kill)
+    [ -z "${2:-}" ] && { echo "usage: agentbus-agent --kill <name>" >&2; exit 1; }
+    NM="${2%%:*}"
+    tmux kill-session -t "agentbus-${NM}" 2>/dev/null && echo "killed tmux session agentbus-${NM}" >&2 || echo "no tmux session agentbus-${NM}" >&2
+    "$AB" close --name "$NM" 2>/dev/null || true
+    exit 0 ;;
+  --detached|--list-detached)
+    echo "Detached agentbus agents:" >&2
+    tmux ls 2>/dev/null | grep '^agentbus-' || echo "  (none)" >&2
+    exit 0 ;;
+esac
 
 # ── Parse [name][:<program>] ──────────────────────────────────────────────────
 SPEC="${1:-}"
@@ -48,50 +74,34 @@ if [[ -z "$NAME" ]]; then
   NAME="${PROGRAM}-${SUFFIX}"
 fi
 
-# ── Extract agentbus-agent flags (--seed, --no-seed, --help, --conversation, --continue) ──
-CUSTOM_SEED=""; NO_SEED=0; REMAINING=()
+# ── Extract agentbus-agent flags ──────────────────────────────────────────────
+CUSTOM_SEED=""; NO_SEED=0; DETACH=0; REMAINING=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)
       grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \?//'
       exit 0 ;;
-    --list|-l)
-      # List sessions for this program and let the user pick one
-      case "$PROGRAM" in
-        codex)
-          echo "Codex sessions:" >&2
-          codex --list-sessions 2>&1
-          echo "" >&2
-          printf "Session ID to resume (or Enter to skip): " >&2
-          read -r SESSION_ID
-          [[ -n "$SESSION_ID" ]] && REMAINING+=(--conversation "$SESSION_ID")
-          ;;
-        agy)
-          echo "agy sessions:" >&2
-          agy --list-sessions 2>&1 || echo "(agy --list-sessions not supported)" >&2
-          printf "Conversation ID to resume (or Enter to skip): " >&2
-          read -r SESSION_ID
-          [[ -n "$SESSION_ID" ]] && REMAINING+=(--conversation "$SESSION_ID")
-          ;;
-        claude)
-          PROJ_DIR="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g')"
-          echo "Claude sessions in current project:" >&2
-          ls -lt "$PROJ_DIR"/*.jsonl 2>/dev/null | awk '{print NR". "$NF}' | sed "s|$PROJ_DIR/||;s|\.jsonl||" | head -10 >&2 || echo "(none found)" >&2
-          printf "Session ID to resume (or Enter to skip): " >&2
-          read -r SESSION_ID
-          [[ -n "$SESSION_ID" ]] && REMAINING+=(--conversation "$SESSION_ID")
-          ;;
-        gemini)
-          echo "Gemini: use --continue for latest session" >&2
-          printf "Resume latest? [y/N]: " >&2
-          read -r YN
-          [[ "$YN" =~ ^[Yy] ]] && REMAINING+=(--continue)
-          ;;
-      esac
-      shift ;;  # consume --list
+    --detach|-d)    DETACH=1; shift ;;
     --no-seed)      NO_SEED=1; shift ;;
     --seed)         CUSTOM_SEED="$2"; shift 2 ;;
     --seed=*)       CUSTOM_SEED="${1#--seed=}"; shift ;;
+    --list|-l)
+      case "$PROGRAM" in
+        codex)  echo "Codex sessions:" >&2; codex --list-sessions 2>&1
+                printf "Session ID (Enter to skip): " >&2; read -r SID
+                [[ -n "$SID" ]] && REMAINING+=(--conversation "$SID") ;;
+        agy)    echo "agy sessions:" >&2; agy --list-sessions 2>&1 || true
+                printf "Conversation ID (Enter to skip): " >&2; read -r SID
+                [[ -n "$SID" ]] && REMAINING+=(--conversation "$SID") ;;
+        claude) PROJ_DIR="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g')"
+                echo "Claude sessions in current project:" >&2
+                ls -t "$PROJ_DIR"/*.jsonl 2>/dev/null | head -10 | xargs -n1 basename 2>/dev/null | sed 's/\.jsonl//' >&2 || echo "(none)" >&2
+                printf "Session ID (Enter to skip): " >&2; read -r SID
+                [[ -n "$SID" ]] && REMAINING+=(--conversation "$SID") ;;
+        gemini) printf "Resume latest gemini session? [y/N]: " >&2; read -r YN
+                [[ "$YN" =~ ^[Yy] ]] && REMAINING+=(--continue) ;;
+      esac
+      shift ;;
     *)              REMAINING+=("$1"); shift ;;
   esac
 done
@@ -105,19 +115,18 @@ esac
 
 # ── Auto-seed: explain AgentBus to the agent ──────────────────────────────────
 send_seed() {
-  local name="$1" msg="$2"
-  # wait up to 20s for the agent to register
-  local waited=0
+  local name="$1" msg="$2" waited=0
   while [[ $waited -lt 20 ]]; do
     sleep 2; waited=$((waited+2))
-    if "$AB" status 2>/dev/null | grep -q "\"name\": \"$name\""; then break; fi
+    "$AB" status 2>/dev/null | grep -q "\"name\": \"$name\"" && break
   done
-  sleep 3  # let the TUI fully settle
+  sleep 3
   "$AB" register --name __seed-sender__ --program shell 2>/dev/null || true
   "$AB" send --from __seed-sender__ --to "$name" --msg-type request "$msg" 2>/dev/null || true
   "$AB" close --name __seed-sender__ 2>/dev/null || true
 }
 
+SEED_MSG=""
 if [[ $NO_SEED -eq 0 ]]; then
   SEED_MSG="${CUSTOM_SEED:-You are '${NAME}' on AgentBus (a local multi-agent message bus). \
 HOW MESSAGES ARRIVE: they are injected directly into your terminal input, prefixed like: \
@@ -128,54 +137,51 @@ HOW TO REPLY: run this shell command (replace SENDER with the from= value you sa
 Example — if you got [agentbus from=atlas-coordinator-codex ...], reply with: \
   ${AB} send --from ${NAME} --to atlas-coordinator-codex --msg-type response \"your reply\" \
 IMPORTANT: do not explain agentbus to others. Just use it and reply. Be concise.}"
-  ( send_seed "$NAME" "$SEED_MSG" ) &
 fi
 
-echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
-"$AB" start 2>/dev/null || true
-
-# ── Run and show resume command on exit ───────────────────────────────────────
-# Capture the session ID after the agent exits (program-specific lookup).
 show_resume() {
-  local name="$1" program="$2"
-  echo "" >&2
-  echo "────────────────────────────────────────────" >&2
+  local name="$1" program="$2" id=""
+  echo "" >&2; echo "────────────────────────────────────────────" >&2
   case "$program" in
-    codex)
-      local id
-      id=$(codex --list-sessions 2>/dev/null | awk 'NR==2{print $1}')
-      if [[ -n "$id" ]]; then
-        echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
-      else
-        echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
-      fi ;;
-    claude)
-      local id
-      id=$(ls -t "$HOME/.claude/projects/"*"/"*.jsonl 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.jsonl//')
-      if [[ -n "$id" ]]; then
-        echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
-      else
-        echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
-      fi ;;
-    agy)
-      local id
-      id=$(agy --list-sessions 2>/dev/null | awk 'NR==1{print $1}')
-      if [[ -n "$id" ]]; then
-        echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
-      else
-        echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
-      fi ;;
-    gemini)
-      echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2 ;;
+    codex)  id=$(codex --list-sessions 2>/dev/null | awk 'NR==2{print $1}') ;;
+    claude) id=$(ls -t "$HOME/.claude/projects/"*"/"*.jsonl 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.jsonl//') ;;
+    agy)    id=$(agy --list-sessions 2>/dev/null | awk 'NR==1{print $1}') ;;
   esac
+  if [[ -n "$id" ]]; then
+    echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
+  else
+    echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
+  fi
   echo "────────────────────────────────────────────" >&2
+}
+
+# ── run_agent: foreground (render) OR detached (tmux, no render) ───────────────
+# Call with the agent command (everything that goes after `agentbus run ... --`).
+run_agent() {
+  "$AB" start 2>/dev/null || true
+  if [[ $DETACH -eq 1 ]]; then
+    local sess; sess="$(sess_name "$NAME")"
+    tmux has-session -t "$sess" 2>/dev/null && { echo "error: '$sess' already running — attach: agentbus-agent --attach $NAME" >&2; exit 1; }
+    local cmd; printf -v cmd '%q ' "$AB" run --name "$NAME" --program "$PROGRAM" -- "$@"
+    tmux new-session -d -s "$sess" -c "$PWD" "$cmd"
+    echo "[agentbus-agent] $NAME ($PROGRAM) detached → tmux '$sess' (not rendered in this terminal)" >&2
+    [[ $NO_SEED -eq 0 ]] && { echo "[agentbus-agent] seeding..." >&2; send_seed "$NAME" "$SEED_MSG"; }
+    echo "" >&2
+    echo "  attach:  agentbus-agent --attach $NAME      (then Ctrl-b then d to detach again)" >&2
+    echo "  send:    $AB send --from ram --to $NAME --msg-type request \"...\"" >&2
+    echo "  stop:    agentbus-agent --kill $NAME" >&2
+  else
+    [[ $NO_SEED -eq 0 ]] && ( send_seed "$NAME" "$SEED_MSG" ) &
+    echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
+    "$AB" run --name "$NAME" --program "$PROGRAM" -- "$@"
+    show_resume "$NAME" "$PROGRAM"
+  fi
 }
 
 # ── Launch with program-specific flags ────────────────────────────────────────
 case "$PROGRAM" in
 
   claude)
-    # Normalize: --conversation <id> → --resume <id>  |  --continue/-c → --continue
     CLAUDE_RESUME=(); CLAUDE_EXTRA=()
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -185,21 +191,16 @@ case "$PROGRAM" in
         *)                CLAUDE_EXTRA+=("$1"); shift ;;
       esac
     done
-    EMPTY_MCP="$(mktemp /tmp/agentbus-agent-empty-mcp.XXXXXX.json)"
-    echo '{"mcpServers":{}}' > "$EMPTY_MCP"
-    trap 'rm -f "$EMPTY_MCP"' EXIT
-    "$AB" run --name "$NAME" --program claude \
-      -- claude --dangerously-skip-permissions \
-                 --strict-mcp-config --mcp-config "$EMPTY_MCP" \
-                 "${CLAUDE_RESUME[@]}" "${CLAUDE_EXTRA[@]}"
-    show_resume "$NAME" "$PROGRAM"
+    # Persistent empty MCP config (NOT auto-deleted — a detached agent needs it to outlive this script)
+    EMPTY_MCP="$HOME/.agentbus/empty-mcp.json"
+    mkdir -p "$HOME/.agentbus"; echo '{"mcpServers":{}}' > "$EMPTY_MCP"
+    run_agent claude --dangerously-skip-permissions \
+                     --strict-mcp-config --mcp-config "$EMPTY_MCP" \
+                     "${CLAUDE_RESUME[@]}" "${CLAUDE_EXTRA[@]}"
     ;;
 
   codex)
-    # Codex resume uses a subcommand: `codex resume <id>` not `--conversation`.
-    # Detect --conversation <id> or --conversation=<id> and convert to the subcommand form.
-    CODEX_RESUME_ID=""
-    CODEX_EXTRA=()
+    CODEX_RESUME_ID=""; CODEX_EXTRA=()
     while [[ $# -gt 0 ]]; do
       case "$1" in
         --conversation=*) CODEX_RESUME_ID="${1#--conversation=}"; shift ;;
@@ -209,28 +210,15 @@ case "$PROGRAM" in
       esac
     done
     if [[ -n "$CODEX_RESUME_ID" && "$CODEX_RESUME_ID" != "__last__" ]]; then
-      "$AB" run --name "$NAME" --program codex \
-        -- codex resume "$CODEX_RESUME_ID" \
-                  --dangerously-bypass-approvals-and-sandbox \
-                  --dangerously-bypass-hook-trust \
-                  "${CODEX_EXTRA[@]}"
+      run_agent codex resume "$CODEX_RESUME_ID" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
     elif [[ "$CODEX_RESUME_ID" == "__last__" ]]; then
-      "$AB" run --name "$NAME" --program codex \
-        -- codex resume --last \
-                  --dangerously-bypass-approvals-and-sandbox \
-                  --dangerously-bypass-hook-trust \
-                  "${CODEX_EXTRA[@]}"
+      run_agent codex resume --last --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
     else
-      "$AB" run --name "$NAME" --program codex \
-        -- codex --dangerously-bypass-approvals-and-sandbox \
-                  --dangerously-bypass-hook-trust \
-                  "${CODEX_EXTRA[@]}"
+      run_agent codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
     fi
-    show_resume "$NAME" "$PROGRAM"
     ;;
 
   gemini)
-    # Normalize: --conversation <id> → -r <id>  |  --continue/-c → -r latest
     GEMINI_RESUME=(); GEMINI_EXTRA=()
     while [[ $# -gt 0 ]]; do
       case "$1" in
@@ -240,19 +228,12 @@ case "$PROGRAM" in
         *)                GEMINI_EXTRA+=("$1"); shift ;;
       esac
     done
-    "$AB" run --name "$NAME" --program gemini \
-      -- gemini --yolo --skip-trust \
-                 --allowed-mcp-server-names __none__ \
-                 "${GEMINI_RESUME[@]}" "${GEMINI_EXTRA[@]}"
-    show_resume "$NAME" "$PROGRAM"
+    run_agent gemini --yolo --skip-trust --allowed-mcp-server-names __none__ "${GEMINI_RESUME[@]}" "${GEMINI_EXTRA[@]}"
     ;;
 
   agy)
     # --conversation and --continue are native agy flags — pass through as-is
-    "$AB" run --name "$NAME" --program agy \
-      -- agy --dangerously-skip-permissions \
-              "$@"
-    show_resume "$NAME" "$PROGRAM"
+    run_agent agy --dangerously-skip-permissions "$@"
     ;;
 
 esac
