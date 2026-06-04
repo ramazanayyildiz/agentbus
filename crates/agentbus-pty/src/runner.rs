@@ -534,18 +534,31 @@ async fn run_bus_loop(
                 // When `idle_threshold == 0` (GenericAdapter) we skip the
                 // whole block — behavior is byte-identical to Phase 1/2.
                 if idle_threshold > 0 {
-                    let max_wait = Duration::from_secs(30);
+                    // Hard cap: a never-ready agent still injects eventually (no
+                    // deadlock). Lowered from 30s — see ready_grace below.
+                    let hard_cap = Duration::from_secs(8);
+                    // Once the PTY has gone idle, only wait this long for the
+                    // prompt-ready signal before injecting anyway. Fix for
+                    // full-screen TUIs (Claude) whose absolutely-positioned byte
+                    // stream our line-based `is_prompt_ready` can't reliably parse:
+                    // idle alone is a strong "agent is waiting" signal, so we don't
+                    // burn the full hard cap when readiness never matches. Codex
+                    // (whose box IS detected) still short-circuits on `ready`.
+                    let ready_grace = Duration::from_millis(1000);
                     let started = Instant::now();
+                    let mut idle_since: Option<Instant> = None;
+                    let mut broke_on = "ready";
                     loop {
                         let now_ms = process_start.elapsed().as_millis() as i64;
                         let last_ms = last_output_ms.load(Ordering::Relaxed);
                         let idle_for = now_ms.saturating_sub(last_ms) as u64;
 
                         if idle_for >= idle_threshold {
-                            // Idle gate satisfied — now check prompt readiness.
-                            // Copy + strip ANSI (preserving box glyphs) so the
-                            // adapter sees an approximation of the rendered
-                            // screen tail.
+                            if idle_since.is_none() {
+                                idle_since = Some(Instant::now());
+                            }
+                            // Idle gate satisfied — check prompt readiness on a
+                            // strip-ANSI (box-preserving) approximation of the tail.
                             let ready = {
                                 let raw = screen_tail
                                     .lock()
@@ -555,20 +568,30 @@ async fn run_bus_loop(
                                 adapter.is_prompt_ready(&tail)
                             };
                             if ready {
+                                broke_on = "ready";
                                 break;
                             }
-                            // Idle but prompt not yet visible (e.g. still in
-                            // boot churn): keep waiting until ready or cap.
+                            // Idle but prompt not detected: inject once the grace
+                            // window since first-idle elapses.
+                            if idle_since.map_or(false, |t| t.elapsed() >= ready_grace) {
+                                broke_on = "idle+grace";
+                                break;
+                            }
+                        } else {
+                            // Output resumed — agent is busy again; reset idle clock.
+                            idle_since = None;
                         }
-                        if started.elapsed() >= max_wait {
-                            debug!(
-                                "idle+ready wait exceeded {:?}; injecting anyway",
-                                max_wait
-                            );
+                        if started.elapsed() >= hard_cap {
+                            broke_on = "hard_cap";
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                    debug!(
+                        "inject gate: broke_on={} waited={}ms",
+                        broke_on,
+                        started.elapsed().as_millis()
+                    );
                 }
 
                 let bytes = adapter.format_message(&message);
