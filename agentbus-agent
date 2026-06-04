@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# agentbus-agent — launch a single agent on the bus with the right flags.
+# Usage: agentbus-agent <name>[:<program>] [extra CLI args...]
+# Programs: claude (default) | codex | gemini | agy
+#
+# Examples:
+#   agentbus-agent my-claude
+#   agentbus-agent a:agy --conversation 51ebafa3-3c46-46d8-a2f5-b12717b608ce
+#   agentbus-agent gem:gemini --model gemini-2.5-pro
+#   agentbus-agent c:codex
+#   agentbus-agent claude-A --resume abc123
+
+set -e
+
+AB="${AGENTBUS_BIN:-$HOME/.local/bin/agentbus}"
+[ -x "$AB" ] || AB="$HOME/.cargo/bin/agentbus"
+[ -x "$AB" ] || { echo "error: agentbus not found (set AGENTBUS_BIN or put it in ~/.local/bin)" >&2; exit 1; }
+
+# ── Parse name[:program] ───────────────────────────────────────────────────────
+SPEC="${1:-}"
+[ -z "$SPEC" ] && { echo "Usage: agentbus-agent <name>[:<program>] [extra CLI args...]" >&2
+  echo "Programs: claude (default) | codex | gemini | agy" >&2; exit 1; }
+shift
+
+if [[ "$SPEC" == *:* ]]; then
+  NAME="${SPEC%%:*}"
+  PROGRAM="${SPEC##*:}"
+else
+  NAME="$SPEC"
+  PROGRAM="claude"
+fi
+
+# Validate
+case "$PROGRAM" in
+  claude|codex|gemini|agy) ;;
+  *) echo "error: unknown program '$PROGRAM' (choose: claude, codex, gemini, agy)" >&2; exit 1 ;;
+esac
+
+echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
+"$AB" start 2>/dev/null || true
+
+# ── Launch with program-specific flags ────────────────────────────────────────
+case "$PROGRAM" in
+
+  claude)
+    # Empty MCP config for a clean boot (bare {} crashes --strict-mcp-config)
+    EMPTY_MCP="$(mktemp /tmp/agentbus-agent-empty-mcp.XXXXXX.json)"
+    echo '{"mcpServers":{}}' > "$EMPTY_MCP"
+    trap 'rm -f "$EMPTY_MCP"' EXIT
+    exec "$AB" run --name "$NAME" --program claude \
+      -- claude --dangerously-skip-permissions \
+                 --strict-mcp-config --mcp-config "$EMPTY_MCP" \
+                 "$@"
+    ;;
+
+  codex)
+    exec "$AB" run --name "$NAME" --program codex \
+      -- codex --dangerously-bypass-approvals-and-sandbox \
+                --dangerously-bypass-hook-trust \
+                "$@"
+    ;;
+
+  gemini)
+    exec "$AB" run --name "$NAME" --program gemini \
+      -- gemini --yolo --skip-trust \
+                 --allowed-mcp-server-names __none__ \
+                 "$@"
+    ;;
+
+  agy)
+    exec "$AB" run --name "$NAME" --program agy \
+      -- agy --dangerously-skip-permissions \
+              "$@"
+    ;;
+
+esac
