@@ -60,6 +60,17 @@ pub trait Adapter: Send + Sync {
     fn is_prompt_ready(&self, _screen_tail: &str) -> bool {
         true
     }
+
+    /// Readiness check against the RAW (un-stripped) screen tail.
+    ///
+    /// Some agents announce "idle, waiting for input" via an OSC escape whose
+    /// payload `strip_ansi_preserve_box` discards (it removes the whole
+    /// `ESC ] … BEL`). For those, line-based `is_prompt_ready` on the stripped
+    /// tail can't see the signal, so the runner ALSO calls this on the raw bytes
+    /// and injects if EITHER returns true. Default: `false`.
+    fn ready_marker_in_raw(&self, _raw_screen_tail: &str) -> bool {
+        false
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -113,6 +124,20 @@ impl Adapter for ClaudeAdapter {
     /// agent_readiness.go.
     fn is_prompt_ready(&self, screen_tail: &str) -> bool {
         strip::has_greater_than_or_slim_box(screen_tail)
+    }
+
+    /// Claude Code emits an OSC notify when it settles idle at the prompt:
+    ///   ESC ] 777;notify;…{"event":"idle_prompt",…,"summary":"Claude is waiting
+    ///   for your input"} BEL
+    /// Its absolutely-positioned full-screen TUI defeats the line-based
+    /// `has_greater_than_or_slim_box` check (the rendered prompt never lands as a
+    /// clean trailing line), so without this the idle gate always falls through to
+    /// the grace/cap. This explicit "waiting for input" signal is reliable; we
+    /// match it on the RAW tail because `strip_ansi_preserve_box` drops the OSC
+    /// payload. Combined with the runner's idle gate (only checked once the PTY is
+    /// quiet), a stale marker from a prior turn can't fire mid-response.
+    fn ready_marker_in_raw(&self, raw_screen_tail: &str) -> bool {
+        raw_screen_tail.contains("\"event\":\"idle_prompt\"")
     }
 }
 
@@ -353,6 +378,19 @@ mod tests {
     fn case_insensitive_matching() {
         assert_eq!(pick("CLAUDE").name(), "claude");
         assert_eq!(pick("Codex").name(), "codex");
+    }
+
+    #[test]
+    fn claude_ready_marker_detects_idle_prompt_osc() {
+        // Claude's raw idle notify (OSC payload survives only in the RAW tail).
+        let raw = "...some output...\u{1b}]777;notify;warp://cli-agent;{\"v\":1,\"agent\":\"claude\",\"event\":\"idle_prompt\",\"summary\":\"Claude is waiting for your input\"}\u{07}";
+        assert!(ClaudeAdapter.ready_marker_in_raw(raw));
+        // No marker → false (must fall through to idle gate, not fire early).
+        assert!(!ClaudeAdapter.ready_marker_in_raw("just streaming response text"));
+        // A different OSC event must NOT count as ready.
+        assert!(!ClaudeAdapter.ready_marker_in_raw("\u{1b}]777;notify;x;{\"event\":\"running\"}\u{07}"));
+        // Other adapters default to no raw marker.
+        assert!(!CodexAdapter.ready_marker_in_raw("\"event\":\"idle_prompt\""));
     }
 
     #[test]

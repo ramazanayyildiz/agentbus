@@ -565,7 +565,9 @@ async fn run_bus_loop(
                                     .map(|t| String::from_utf8_lossy(&t).into_owned())
                                     .unwrap_or_default();
                                 let tail = crate::strip::strip_ansi_preserve_box(&raw);
-                                adapter.is_prompt_ready(&tail)
+                                // Either the line-based prompt box (codex etc.) OR an
+                                // explicit raw OSC "waiting for input" marker (claude).
+                                adapter.is_prompt_ready(&tail) || adapter.ready_marker_in_raw(&raw)
                             };
                             if ready {
                                 broke_on = "ready";
