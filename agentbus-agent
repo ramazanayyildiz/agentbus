@@ -65,10 +65,36 @@ case "$PROGRAM" in
     ;;
 
   codex)
-    exec "$AB" run --name "$NAME" --program codex \
-      -- codex --dangerously-bypass-approvals-and-sandbox \
-                --dangerously-bypass-hook-trust \
-                "$@"
+    # Codex resume uses a subcommand: `codex resume <id>` not `--conversation`.
+    # Detect --conversation <id> or --conversation=<id> and convert to the subcommand form.
+    CODEX_RESUME_ID=""
+    CODEX_EXTRA=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --conversation=*) CODEX_RESUME_ID="${1#--conversation=}"; shift ;;
+        --conversation)   CODEX_RESUME_ID="$2"; shift 2 ;;
+        --continue|-c)    CODEX_RESUME_ID="__last__"; shift ;;
+        *)                CODEX_EXTRA+=("$1"); shift ;;
+      esac
+    done
+    if [[ -n "$CODEX_RESUME_ID" && "$CODEX_RESUME_ID" != "__last__" ]]; then
+      exec "$AB" run --name "$NAME" --program codex \
+        -- codex resume "$CODEX_RESUME_ID" \
+                  --dangerously-bypass-approvals-and-sandbox \
+                  --dangerously-bypass-hook-trust \
+                  "${CODEX_EXTRA[@]}"
+    elif [[ "$CODEX_RESUME_ID" == "__last__" ]]; then
+      exec "$AB" run --name "$NAME" --program codex \
+        -- codex resume --last \
+                  --dangerously-bypass-approvals-and-sandbox \
+                  --dangerously-bypass-hook-trust \
+                  "${CODEX_EXTRA[@]}"
+    else
+      exec "$AB" run --name "$NAME" --program codex \
+        -- codex --dangerously-bypass-approvals-and-sandbox \
+                  --dangerously-bypass-hook-trust \
+                  "${CODEX_EXTRA[@]}"
+    fi
     ;;
 
   gemini)
