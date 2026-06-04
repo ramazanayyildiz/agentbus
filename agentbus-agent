@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # agentbus-agent — launch a single agent on the bus with the right flags.
-# Usage: agentbus-agent <name>[:<program>] [extra CLI args...]
+# Usage: agentbus-agent [<name>][:<program>] [extra CLI args...]
 # Programs: claude (default) | codex | gemini | agy
+# If no name given, a unique id is generated (e.g. "claude-a3f2").
 #
 # Examples:
-#   agentbus-agent my-claude
-#   agentbus-agent a:agy --conversation 51ebafa3-3c46-46d8-a2f5-b12717b608ce
-#   agentbus-agent gem:gemini --model gemini-2.5-pro
-#   agentbus-agent c:codex
-#   agentbus-agent claude-A --resume abc123
+#   agentbus-agent                    # claude, unique name
+#   agentbus-agent :agy               # agy, unique name
+#   agentbus-agent :agy --conversation 51ebafa3-3c46-46d8-a2f5-b12717b608ce
+#   agentbus-agent :gemini --model gemini-2.5-pro
+#   agentbus-agent mybot:codex
 
 set -e
 
@@ -16,18 +17,28 @@ AB="${AGENTBUS_BIN:-$HOME/.local/bin/agentbus}"
 [ -x "$AB" ] || AB="$HOME/.cargo/bin/agentbus"
 [ -x "$AB" ] || { echo "error: agentbus not found (set AGENTBUS_BIN or put it in ~/.local/bin)" >&2; exit 1; }
 
-# ── Parse name[:program] ───────────────────────────────────────────────────────
+# ── Parse [name][:<program>] ──────────────────────────────────────────────────
 SPEC="${1:-}"
-[ -z "$SPEC" ] && { echo "Usage: agentbus-agent <name>[:<program>] [extra CLI args...]" >&2
-  echo "Programs: claude (default) | codex | gemini | agy" >&2; exit 1; }
-shift
-
-if [[ "$SPEC" == *:* ]]; then
-  NAME="${SPEC%%:*}"
-  PROGRAM="${SPEC##*:}"
-else
-  NAME="$SPEC"
+# If first arg starts with - it's a flag, not a spec → no spec given
+if [[ "$SPEC" == -* ]] || [[ -z "$SPEC" ]]; then
+  NAME=""
   PROGRAM="claude"
+else
+  shift
+  if [[ "$SPEC" == *:* ]]; then
+    NAME="${SPEC%%:*}"
+    PROGRAM="${SPEC##*:}"
+    [ -z "$PROGRAM" ] && PROGRAM="claude"
+  else
+    NAME="$SPEC"
+    PROGRAM="claude"
+  fi
+fi
+
+# Auto-generate a unique name if none given
+if [[ -z "$NAME" ]]; then
+  SUFFIX="$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 4 2>/dev/null || echo "$$")"
+  NAME="${PROGRAM}-${SUFFIX}"
 fi
 
 # Validate
