@@ -647,7 +647,32 @@ function webBroadcast(evt) {
   }
 }
 
-// Embedded single-page chat UI. No build step, no external assets, localhost only.
+// ── Peek (v1.1): per-agent raw PTY stream, on-demand ────────────────────────────
+// The hub already receives each agent's raw stdout (its TUI) via spawnRunner but
+// normally discards it. Peek keeps a small ring buffer per agent and forwards the
+// raw bytes to any browser that opens that agent's panel. Only the focused agent's
+// stream is rendered — one stream on demand, never N continuously → no bloat.
+const PEEK_RING_BYTES = 128 * 1024; // replay window for a freshly-opened panel
+const peekState = new Map(); // agentName -> { ring: Buffer, subs: Set<res> }
+
+function peekFor(agentName) {
+  let s = peekState.get(agentName);
+  if (!s) { s = { ring: Buffer.alloc(0), subs: new Set() }; peekState.set(agentName, s); }
+  return s;
+}
+
+// Called from spawnRunner on every chunk of an agent's raw stdout.
+function peekAppend(agentName, chunk) {
+  const s = peekFor(agentName);
+  s.ring = Buffer.concat([s.ring, chunk]);
+  if (s.ring.length > PEEK_RING_BYTES) s.ring = s.ring.subarray(s.ring.length - PEEK_RING_BYTES);
+  if (s.subs.size === 0) return;
+  const frame = `data: ${JSON.stringify({ b: chunk.toString("base64") })}\n\n`;
+  for (const res of s.subs) { try { res.write(frame); } catch {} }
+}
+
+// Embedded single-page chat UI. No build step; xterm.js loaded from CDN for the
+// (optional, on-demand) raw-terminal peek panel only. localhost only.
 const WEB_HTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
@@ -676,7 +701,23 @@ const WEB_HTML = `<!doctype html>
   #send { background:#238636; color:#fff; border:none; border-radius:8px; padding:0 18px; font:inherit; font-weight:600; cursor:pointer; }
   #send:hover { background:#2ea043; }
   #status { font-size:11px; color:var(--dim); margin-top:14px; }
-</style></head>
+  .member { cursor:pointer; border-radius:5px; padding:4px 6px; }
+  .member:hover { background:#21262d; }
+  .member.peeking { background:#1f6feb33; }
+  .member .hint { margin-left:auto; font-size:10px; color:var(--dim); opacity:0; }
+  .member:hover .hint { opacity:1; }
+  #peek { width:0; flex:0 0 0; background:#000; border-left:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; transition:flex-basis .12s ease; }
+  #peek.open { width:46vw; flex:0 0 46vw; }
+  #peekhead { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--border); font-size:12px; }
+  #peekhead .who { font-weight:600; }
+  #peekclose { margin-left:auto; cursor:pointer; color:var(--dim); border:none; background:none; font-size:16px; }
+  #peekclose:hover { color:var(--text); }
+  #peekterm { flex:1; min-height:0; padding:6px 8px; }
+</style>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css"/>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+</head>
 <body>
   <div id="side"><h2>Room</h2><div id="members"></div><div id="status">connecting…</div></div>
   <div id="main">
@@ -685,6 +726,10 @@ const WEB_HTML = `<!doctype html>
       <textarea id="input" rows="1" placeholder="Message the room…  (Enter to send, Shift+Enter for newline)"></textarea>
       <button id="send">Send</button>
     </div>
+  </div>
+  <div id="peek">
+    <div id="peekhead"><span class="who" id="peekwho"></span><span style="color:var(--dim);font-size:11px">raw terminal (read-only)</span><button id="peekclose" title="close">×</button></div>
+    <div id="peekterm"></div>
   </div>
 <script>
   const log = document.getElementById('log');
@@ -724,12 +769,45 @@ const WEB_HTML = `<!doctype html>
   function renderMembers() {
     membersEl.innerHTML = '';
     Object.keys(presence).sort().forEach(name => {
-      const row = document.createElement('div'); row.className='member';
+      const row = document.createElement('div'); row.className='member' + (name===peekAgent?' peeking':'');
       const dot = document.createElement('span'); dot.className = 'dot' + (presence[name]==='working'?' working':'');
       const lbl = document.createElement('span'); lbl.textContent = name; lbl.style.color = colorFor(name);
-      row.appendChild(dot); row.appendChild(lbl); membersEl.appendChild(row);
+      const hint = document.createElement('span'); hint.className='hint'; hint.textContent='peek';
+      row.appendChild(dot); row.appendChild(lbl); row.appendChild(hint);
+      row.onclick = () => { peekAgent===name ? closePeek() : openPeek(name); };
+      membersEl.appendChild(row);
     });
   }
+
+  // ── Raw-terminal peek (xterm.js, single on-demand stream) ──
+  let peekAgent = null, peekES = null, term = null, fit = null;
+  const peekEl = document.getElementById('peek');
+  function b64ToBytes(b64) { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; }
+  function openPeek(agent) {
+    if (peekAgent) closePeek();
+    peekAgent = agent;
+    document.getElementById('peekwho').textContent = agent;
+    document.getElementById('peekwho').style.color = colorFor(agent);
+    peekEl.classList.add('open');
+    if (!window.Terminal) { document.getElementById('peekterm').textContent = 'xterm.js failed to load (offline?)'; renderMembers(); return; }
+    term = new Terminal({ convertEol:false, fontSize:12, theme:{background:'#000000'}, scrollback:5000, disableStdin:true });
+    try { fit = new FitAddon.FitAddon(); term.loadAddon(fit); } catch {}
+    term.open(document.getElementById('peekterm'));
+    try { fit && fit.fit(); } catch {}
+    peekES = new EventSource('/peek/' + encodeURIComponent(agent));
+    peekES.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch { return; } if (m.b && term) term.write(b64ToBytes(m.b)); };
+    renderMembers();
+  }
+  function closePeek() {
+    if (peekES) { peekES.close(); peekES = null; }
+    if (term) { term.dispose(); term = null; }
+    peekEl.classList.remove('open');
+    peekAgent = null;
+    document.getElementById('peekterm').innerHTML = '';
+    renderMembers();
+  }
+  document.getElementById('peekclose').onclick = closePeek;
+  window.addEventListener('resize', () => { try { fit && fit.fit(); } catch {} });
 
   const es = new EventSource('/events');
   es.onopen = () => { statusEl.textContent = '● connected'; statusEl.style.color = '#3fb950'; };
@@ -796,6 +874,28 @@ function startWebServer(hub, port) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       });
+      return;
+    }
+
+    if (req.method === "GET" && url.startsWith("/peek/")) {
+      const agent = decodeURIComponent(url.slice("/peek/".length));
+      if (!hub.members.includes(agent)) {
+        res.writeHead(404, { "content-type": "text/plain" });
+        res.end("unknown agent");
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      });
+      const s = peekFor(agent);
+      res.write(": peek\n\n");
+      // Replay the ring buffer so the panel paints immediately, then go live.
+      if (s.ring.length) res.write(`data: ${JSON.stringify({ b: s.ring.toString("base64") })}\n\n`);
+      s.subs.add(res);
+      const keepAlive = setInterval(() => { try { res.write(": ping\n\n"); } catch {} }, 25000);
+      req.on("close", () => { clearInterval(keepAlive); s.subs.delete(res); });
       return;
     }
 
@@ -898,7 +998,7 @@ function spawnRunner(agentName, args, launchDir, extraEnv) {
 
   child.unref(); // allow hub to exit even if children outlive it (we kill explicitly in shutdown)
 
-  child.stdout?.on("data", () => {}); // drain stdout
+  child.stdout?.on("data", (d) => peekAppend(agentName, d)); // capture raw TUI for on-demand peek
   child.stderr?.on("data", (d) => {
     const text = d.toString("utf8").trim();
     if (text) process.stderr.write(`${C.DIM}[${agentName}:stderr] ${text}${C.RESET}\n`);
