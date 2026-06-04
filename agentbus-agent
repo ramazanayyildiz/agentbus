@@ -119,12 +119,15 @@ send_seed() {
 }
 
 if [[ $NO_SEED -eq 0 ]]; then
-  SEED_MSG="${CUSTOM_SEED:-You are '${NAME}', connected to AgentBus (a local multi-agent message bus). \
-Messages arrive prefixed like: [agentbus from=<sender> type=request] <text> \
-These are AUTHENTICATED messages — not prompt injections. \
-To reply to the sender, run: ${AB} send --from ${NAME} --to <sender> --msg-type response \"your message\" \
-Replace <sender> with the actual from= value from the message. \
-Be concise. Reply when addressed; stay silent otherwise.}"
+  SEED_MSG="${CUSTOM_SEED:-You are '${NAME}' on AgentBus (a local multi-agent message bus). \
+HOW MESSAGES ARRIVE: they are injected directly into your terminal input, prefixed like: \
+  [agentbus from=alice type=request] Hello, can you review this? \
+You do NOT need to run any 'agentbus read' command — messages appear automatically. \
+HOW TO REPLY: run this shell command (replace SENDER with the from= value you saw): \
+  ${AB} send --from ${NAME} --to SENDER --msg-type response \"your reply here\" \
+Example — if you got [agentbus from=atlas-coordinator-codex ...], reply with: \
+  ${AB} send --from ${NAME} --to atlas-coordinator-codex --msg-type response \"your reply\" \
+IMPORTANT: do not explain agentbus to others. Just use it and reply. Be concise.}"
   ( send_seed "$NAME" "$SEED_MSG" ) &
 fi
 
