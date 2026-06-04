@@ -54,14 +54,23 @@ echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
 case "$PROGRAM" in
 
   claude)
-    # Empty MCP config for a clean boot (bare {} crashes --strict-mcp-config)
+    # Normalize: --conversation <id> → --resume <id>  |  --continue/-c → --continue
+    CLAUDE_RESUME=(); CLAUDE_EXTRA=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --conversation=*) CLAUDE_RESUME=(--resume "${1#--conversation=}"); shift ;;
+        --conversation)   CLAUDE_RESUME=(--resume "$2"); shift 2 ;;
+        --continue|-c)    CLAUDE_RESUME=(--continue); shift ;;
+        *)                CLAUDE_EXTRA+=("$1"); shift ;;
+      esac
+    done
     EMPTY_MCP="$(mktemp /tmp/agentbus-agent-empty-mcp.XXXXXX.json)"
     echo '{"mcpServers":{}}' > "$EMPTY_MCP"
     trap 'rm -f "$EMPTY_MCP"' EXIT
     exec "$AB" run --name "$NAME" --program claude \
       -- claude --dangerously-skip-permissions \
                  --strict-mcp-config --mcp-config "$EMPTY_MCP" \
-                 "$@"
+                 "${CLAUDE_RESUME[@]}" "${CLAUDE_EXTRA[@]}"
     ;;
 
   codex)
@@ -98,10 +107,20 @@ case "$PROGRAM" in
     ;;
 
   gemini)
+    # Normalize: --conversation <id> → -r <id>  |  --continue/-c → -r latest
+    GEMINI_RESUME=(); GEMINI_EXTRA=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --conversation=*) GEMINI_RESUME=(-r "${1#--conversation=}"); shift ;;
+        --conversation)   GEMINI_RESUME=(-r "$2"); shift 2 ;;
+        --continue|-c)    GEMINI_RESUME=(-r latest); shift ;;
+        *)                GEMINI_EXTRA+=("$1"); shift ;;
+      esac
+    done
     exec "$AB" run --name "$NAME" --program gemini \
       -- gemini --yolo --skip-trust \
                  --allowed-mcp-server-names __none__ \
-                 "$@"
+                 "${GEMINI_RESUME[@]}" "${GEMINI_EXTRA[@]}"
     ;;
 
   agy)
