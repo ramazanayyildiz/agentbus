@@ -249,17 +249,20 @@ const AGENT_NAME_RE = /^[A-Za-z0-9_-]+$/;
  *   { error: string }   on invalid name or unknown program
  */
 function parseAgentSpec(spec) {
+  // Forms: "name" | "name:program" | "name:program:model"
+  // (model is optional; e.g. claude-A:claude:sonnet, codex-A:codex:gpt-5.1).
   const trimmed = String(spec).trim();
-  const colon = trimmed.indexOf(":");
-  const name = colon === -1 ? trimmed : trimmed.slice(0, colon);
-  const program = colon === -1 ? "claude" : trimmed.slice(colon + 1);
+  const parts = trimmed.split(":");
+  const name = parts[0] || "";
+  const program = parts.length >= 2 && parts[1] ? parts[1] : "claude";
+  const model = parts.length >= 3 && parts[2] ? parts[2] : null;
   if (!AGENT_NAME_RE.test(name)) {
     return { error: `invalid agent name "${name}" — only [A-Za-z0-9_-] allowed` };
   }
   if (!VALID_PROGRAMS.includes(program)) {
     return { error: `invalid program "${program}" for agent "${name}" — must be one of ${VALID_PROGRAMS.join(", ")}` };
   }
-  return { name, program };
+  return { name, program, model };
 }
 
 /**
@@ -269,9 +272,9 @@ function parseAgentSpec(spec) {
  * FIX #4: the trusted dir is now the USER'S launchDir (where codex runs via --cd),
  * not a throwaway tmp workdir — so the agent can see and work in the real project.
  */
-function buildCodexConfigToml(trustedDir) {
+function buildCodexConfigToml(trustedDir, model = "gpt-5.5") {
   return (
-    `model = "gpt-5.5"\n` +
+    `model = "${model}"\n` +
     `model_reasoning_effort = "low"\n` +
     `[projects."${trustedDir}"]\n` +
     `trust_level = "trusted"\n`
@@ -369,12 +372,13 @@ function codexHomeFor(roomId, name) {
  * agents[] carries each member's program + (program-specific) resume handle:
  *   codex → codexHome path; claude → claudeSessionId (uuid). Either may be absent.
  */
-function serializeState(roomId, members, programs, resumeInfo) {
+function serializeState(roomId, members, programs, resumeInfo, models = {}) {
   return {
     roomId,
     updatedAt: new Date().toISOString(),
     agents: members.map((name) => {
       const a = { name, program: programs[name] || "claude" };
+      if (models && models[name]) a.model = models[name];
       const info = resumeInfo[name] || {};
       if (info.codexHome) a.codexHome = info.codexHome;
       if (info.claudeSessionId) a.claudeSessionId = info.claudeSessionId;
@@ -394,6 +398,7 @@ function deserializeState(obj) {
     .map((a) => ({
       name: a.name,
       program: VALID_PROGRAMS.includes(a.program) ? a.program : "claude",
+      model: typeof a.model === "string" ? a.model : undefined,
       codexHome: typeof a.codexHome === "string" ? a.codexHome : undefined,
       claudeSessionId: typeof a.claudeSessionId === "string" ? a.claudeSessionId : undefined,
     }));
@@ -706,8 +711,8 @@ const WEB_HTML = `<!doctype html>
   .member.peeking { background:#1f6feb33; }
   .member .hint { margin-left:auto; font-size:10px; color:var(--dim); opacity:0; }
   .member:hover .hint { opacity:1; }
-  #peek { width:0; flex:0 0 0; background:#000; border-left:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; transition:flex-basis .12s ease; }
-  #peek.open { width:46vw; flex:0 0 46vw; }
+  #peek { display:none; flex:0 0 46vw; width:46vw; background:#000; border-left:1px solid var(--border); flex-direction:column; overflow:hidden; }
+  #peek.open { display:flex; }
   #peekhead { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--panel); border-bottom:1px solid var(--border); font-size:12px; }
   #peekhead .who { font-weight:600; }
   #peekclose { margin-left:auto; cursor:pointer; color:var(--dim); border:none; background:none; font-size:16px; }
@@ -780,7 +785,7 @@ const WEB_HTML = `<!doctype html>
   }
 
   // ── Raw-terminal peek (xterm.js, single on-demand stream) ──
-  let peekAgent = null, peekES = null, term = null, fit = null;
+  let peekAgent = null, peekES = null, term = null, fit = null, peekRO = null;
   const peekEl = document.getElementById('peek');
   function b64ToBytes(b64) { const bin = atob(b64); const u = new Uint8Array(bin.length); for (let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return u; }
   function openPeek(agent) {
@@ -790,15 +795,21 @@ const WEB_HTML = `<!doctype html>
     document.getElementById('peekwho').style.color = colorFor(agent);
     peekEl.classList.add('open');
     if (!window.Terminal) { document.getElementById('peekterm').textContent = 'xterm.js failed to load (offline?)'; renderMembers(); return; }
-    term = new Terminal({ convertEol:false, fontSize:12, theme:{background:'#000000'}, scrollback:5000, disableStdin:true });
-    try { fit = new FitAddon.FitAddon(); term.loadAddon(fit); } catch {}
-    term.open(document.getElementById('peekterm'));
-    try { fit && fit.fit(); } catch {}
+    const host = document.getElementById('peekterm');
+    // The agent PTY is a FIXED 120x40 (runner default; the hub's stdout is a pipe so
+    // no local size is detected). Match it EXACTLY — fitting to the panel instead would
+    // wrap the absolutely-positioned TUI at the wrong columns and shred every box. Pick
+    // a font size so all 120 cols fit the panel width.
+    const COLS = 120, ROWS = 40;
+    const fontSize = Math.max(6, Math.min(13, Math.floor(host.clientWidth / (COLS * 0.62))));
+    term = new Terminal({ cols:COLS, rows:ROWS, convertEol:false, fontSize, theme:{background:'#000000'}, scrollback:8000, disableStdin:true });
+    term.open(host);
     peekES = new EventSource('/peek/' + encodeURIComponent(agent));
     peekES.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch { return; } if (m.b && term) term.write(b64ToBytes(m.b)); };
     renderMembers();
   }
   function closePeek() {
+    if (peekRO) { peekRO.disconnect(); peekRO = null; }
     if (peekES) { peekES.close(); peekES = null; }
     if (term) { term.dispose(); term = null; }
     peekEl.classList.remove('open');
@@ -1019,7 +1030,7 @@ function spawnRunner(agentName, args, launchDir, extraEnv) {
  * on fresh launch and store it. On --resume we relaunch `claude --resume <uuid>`.
  * `resumeSessionId` (when set) takes precedence and is passed to --resume.
  */
-function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId = null } = {}) {
+function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId = null, model = null } = {}) {
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
   const spFile = path.join(os.tmpdir(), `room-sp-${agentName}-${roomId}.txt`);
   fs.writeFileSync(spFile, prompt);
@@ -1050,10 +1061,11 @@ function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDi
     "--strict-mcp-config",
     "--mcp-config", emptyMcp,
     "--append-system-prompt-file", spFile,
+    ...(model ? ["--model", model] : []),
     ...sessionArgs,
   ];
 
-  printSystemMsg(`Launching claude agent ${agentName} in ${launchDir}${resumeSessionId ? ` (resuming ${claudeSessionId})` : ""}...`);
+  printSystemMsg(`Launching claude agent ${agentName} in ${launchDir}${model ? ` [model=${model}]` : ""}${resumeSessionId ? ` (resuming ${claudeSessionId})` : ""}...`);
 
   const child = spawnRunner(agentName, args, launchDir, null);
 
@@ -1080,7 +1092,7 @@ function launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDi
  *  - codex runs with `--cd launchDir` (FIX #4) so it works in the user's actual project.
  *    `resume:true` (FEATURE #1) relaunches the prior session via `codex resume --last --all`.
  */
-function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false } = {}) {
+function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false, model = null } = {}) {
   const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
   const codexHome = codexHomeFor(roomId, agentName);
 
@@ -1103,7 +1115,7 @@ function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir
 
   // config.toml: model + pre-trusted launchDir (FIX #4), no MCP servers. Rewritten each
   // launch (cheap, idempotent) so a moved launchDir re-trusts correctly.
-  fs.writeFileSync(path.join(codexHome, "config.toml"), buildCodexConfigToml(launchDir));
+  fs.writeFileSync(path.join(codexHome, "config.toml"), buildCodexConfigToml(launchDir, model || "gpt-5.5"));
 
   // AGENTS.md in the HOME (FIX #4): global instructions reused on every codex invocation,
   // including resume. Same room system prompt Claude gets — consistent roster/trust framing.
@@ -1153,7 +1165,8 @@ function launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir
  * gemini replies `--from <busId> --to <roomBus>` exactly like claude/codex). `resume:true`
  * adds `-r latest` for gemini's native per-project session resume.
  */
-function launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false } = {}) {
+function launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false, model = null } = {}) {
+  if (model) printSystemMsg(`note: per-agent model override ("${model}") not yet wired for gemini — using its default`);
   const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
   // (A) Register on the bus under the namespaced busId, not the raw display name.
@@ -1183,7 +1196,8 @@ function launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDi
  * agy replies `--from <busId> --to <roomBus>` exactly like claude/codex/gemini).
  * `resume:true` adds `--continue` for agy's best-effort session resume.
  */
-function launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false } = {}) {
+function launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false, model = null } = {}) {
+  if (model) printSystemMsg(`note: per-agent model override ("${model}") not yet wired for agy — using its default`);
   const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
   const prompt = generateSystemPrompt(agentName, allAgents, roomId);
   // (A) Register on the bus under the namespaced busId, not the raw display name.
@@ -1208,18 +1222,18 @@ function launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, 
  *   { claudeSessionId: <uuid> } → relaunch claude via `claude --resume <uuid>`
  * Absent/empty → fresh launch. Keeps launchAgents() agnostic of program details.
  */
-function launchAgent(agentName, program, allAgents, roomId, launchDir, transcriptDir, resume = {}) {
+function launchAgent(agentName, program, allAgents, roomId, launchDir, transcriptDir, resume = {}, model = null) {
   if (program === "codex") {
-    return launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.codex });
+    return launchCodexAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.codex, model });
   }
   if (program === "gemini") {
-    return launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.gemini });
+    return launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.gemini, model });
   }
   if (program === "agy") {
-    return launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.agy });
+    return launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.agy, model });
   }
   // default + 'claude'
-  return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId: resume.claudeSessionId || null });
+  return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId: resume.claudeSessionId || null, model });
 }
 
 /**
@@ -1346,7 +1360,7 @@ async function seedAgent(agentName, allAgents, roomId) {
 // ── Main Hub ──────────────────────────────────────────────────────────────────
 
 class RoomHub {
-  constructor(roomId, agentNames, cbMax = 6, programs = {}) {
+  constructor(roomId, agentNames, cbMax = 6, programs = {}, models = {}) {
     this.roomId = roomId;
     // BUS identity, namespaced per room ("room-<roomId>"). Used everywhere the hub
     // talks ON the bus (Register name, --from on relay/seed sends, --to reply target,
@@ -1356,6 +1370,8 @@ class RoomHub {
     this.members = agentNames; // agent names only (not "ram") — stays a string[] (load-bearing)
     // programs: { <agentName>: "claude" | "codex" }. Names absent here default to 'claude'.
     this.programs = programs;
+    // models: { <agentName>: "<model>" } optional per-agent model override. Absent = CLI default.
+    this.models = models || {};
     this.cbMax = cbMax;
     this.cb = new CircuitBreaker(cbMax);
     this.children = []; // { child, spFile, agentName, emptyMcp }
@@ -1387,7 +1403,7 @@ class RoomHub {
     try {
       const file = stateFilePathFor(this.roomId);
       fs.mkdirSync(path.dirname(file), { recursive: true });
-      const state = serializeState(this.roomId, this.members, this.programs, this.resumeInfo);
+      const state = serializeState(this.roomId, this.members, this.programs, this.resumeInfo, this.models);
       fs.writeFileSync(file, JSON.stringify(state, null, 2));
     } catch (e) {
       // Non-fatal: resume just won't be available if we couldn't persist.
@@ -1630,7 +1646,9 @@ class RoomHub {
   markWorking(name) {
     if (!this.working.has(name)) {
       this.working.add(name);
-      printSystemMsg(`${C.DIM}${name} is working…${C.RESET}`);
+      // Terminal-only line (NOT printSystemMsg) so it does not pollute the web
+      // transcript — the browser shows "working" via the roster dot (presence event).
+      writeOut(`\n${C.DIM}[room] ${name} is working…${C.RESET}`);
       webRoster = this.members.slice();
       webBroadcast({ type: "presence", agent: name, state: "working" });
     }
@@ -1887,7 +1905,7 @@ class RoomHub {
       printSystemMsg(`usage: /add <name>[:<program>] — ${spec.error}`);
       return;
     }
-    const { name, program } = spec;
+    const { name, program, model } = spec;
     if (this.members.includes(name)) {
       printSystemMsg(`${name} is already a member.`);
       return;
@@ -1896,6 +1914,7 @@ class RoomHub {
     // this.members) and the exit-handler pruning see a consistent member set.
     this.members.push(name);
     this.programs[name] = program;
+    if (model) this.models[name] = model;
 
     const doAdd = async () => {
       // Roster shown to the new agent = the full current member list (display names).
@@ -1916,6 +1935,7 @@ class RoomHub {
       // and leaving it in members would make every future relay target a dead busId.
       this.members = this.members.filter((m) => m !== name);
       delete this.programs[name];
+      delete this.models[name];
       delete this.resumeInfo[name];
       this.clearWorking(name);
     });
@@ -1942,6 +1962,7 @@ class RoomHub {
     // own 'exit' handler also prunes members — harmless double-removal via filter.)
     this.members = this.members.filter((m) => m !== name);
     delete this.programs[name];
+    delete this.models[name];
     delete this.resumeInfo[name]; // FEATURE #1: drop its resume handle (it's being removed for good)
     this.clearWorking(name);
     if (idx !== -1) this.children.splice(idx, 1);
@@ -1983,7 +2004,8 @@ class RoomHub {
       this.roomId,
       launchDir,
       os.tmpdir(),
-      resume
+      resume,
+      (this.models && this.models[agentName]) || null
     );
     // FEATURE #1: record this agent's resume handle so writeState() persists it.
     // codex → its stable home; claude → the pinned session uuid.
@@ -2238,8 +2260,10 @@ class RoomHub {
         // Adopt the persisted roster (overrides whatever --agents was passed).
         this.members = loaded.agents.map((a) => a.name);
         this.programs = {};
+        this.models = {};
         for (const a of loaded.agents) {
           this.programs[a.name] = a.program;
+          if (a.model) this.models[a.name] = a.model;
           // codex → resume:true; gemini → resume:true (`-r latest`); agy → resume:true (`--continue`);
           // claude → restore its pinned session id.
           resumeHandles[a.name] = a.program === "codex"
@@ -2567,6 +2591,26 @@ async function runSelfTest() {
     assert("spec a:agy: name", agy.name === "a");
     assert("spec a:agy: program", agy.program === "agy");
     assert("spec a:agy: no error", !agy.error);
+
+    // model: bare/2-part specs carry model=null
+    assert("spec bare: model null", bare.model === null);
+    assert("spec foo:claude: model null", explicitClaude.model === null);
+
+    // name:program:model parses the model
+    const withModel = parseAgentSpec("claude-A:claude:sonnet");
+    assert("spec :model: name", withModel.name === "claude-A");
+    assert("spec :model: program", withModel.program === "claude");
+    assert("spec :model: model", withModel.model === "sonnet");
+    assert("spec :model: no error", !withModel.error);
+
+    // model with a dotted/hyphenated version string
+    const codexModel = parseAgentSpec("codex-A:codex:gpt-5.1");
+    assert("spec codex :model: program", codexModel.program === "codex");
+    assert("spec codex :model: model", codexModel.model === "gpt-5.1");
+
+    // buildCodexConfigToml respects model override (and defaults when omitted)
+    assert("codex toml: default model", buildCodexConfigToml("/x").includes('model = "gpt-5.5"'));
+    assert("codex toml: model override", buildCodexConfigToml("/x", "gpt-5.1").includes('model = "gpt-5.1"'));
 
     // unknown program rejected
     const bad = parseAgentSpec("x:perl");
@@ -2945,6 +2989,7 @@ function parseArgs(argv) {
     launchDir: process.cwd(),
     resume: false,
     web: null, // null = off; otherwise a port number
+    models: {}, // optional per-agent model override (name -> model string)
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -2956,6 +3001,7 @@ function parseArgs(argv) {
       const specs = args[++i].split(",").map((s) => s.trim()).filter(Boolean);
       const names = [];
       const programs = {};
+      const models = {};
       for (const spec of specs) {
         const r = parseAgentSpec(spec);
         if (r.error) {
@@ -2964,9 +3010,11 @@ function parseArgs(argv) {
         }
         names.push(r.name);
         programs[r.name] = r.program;
+        if (r.model) models[r.name] = r.model;
       }
       opts.agents = names;
       opts.programs = programs;
+      opts.models = models;
     } else if (a === "--cb-max" && args[i + 1]) {
       opts.cbMax = parseInt(args[++i], 10) || 6;
     } else if (a === "--launch-dir" && args[i + 1]) {
@@ -3011,8 +3059,9 @@ async function main() {
   if (!opts.roomId) {
     process.stderr.write(
       "Usage: agentbus-room.mjs <room-id> [--agents name[:program],...] [--cb-max 6] [--launch-dir <dir>] [--no-agents] [--resume]\n" +
-      "       --agents accepts `name:program` (program = claude|codex|gemini|agy); a bare name defaults to claude.\n" +
-      "       e.g. --agents claude-A,codex-A:codex  or  --agents claude-A,gem:gemini,a:agy\n" +
+      "       --agents accepts `name:program[:model]` (program = claude|codex|gemini|agy); a bare name defaults to claude.\n" +
+      "       e.g. --agents claude-A,codex-A:codex  or  --agents claude-A:claude:sonnet,codex-A:codex:gpt-5.1\n" +
+      "       model override is wired for claude (--model) and codex (config model); gemini/agy ignore it for now.\n" +
       "       --resume    reconnect to a closed room: replay history + restore each agent's session\n" +
       "       --no-agents attach to agents already running (hub-died-but-agents-survived reconnect)\n" +
       "       --web [port] also serve a chat-style Web UI (default port 8787, localhost only)\n" +
@@ -3021,7 +3070,7 @@ async function main() {
     process.exit(1);
   }
 
-  const hub = new RoomHub(opts.roomId, opts.agents, opts.cbMax, opts.programs);
+  const hub = new RoomHub(opts.roomId, opts.agents, opts.cbMax, opts.programs, opts.models);
   hub.resume = opts.resume; // FEATURE #1: --resume restores history + agent sessions
 
   // Web UI (chat-style mirror) — optional, localhost only.
