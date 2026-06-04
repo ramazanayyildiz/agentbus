@@ -170,6 +170,44 @@ impl Adapter for OpencodeAdapter {
     }
 }
 
+/// AntiGravity CLI adapter.
+///
+/// `agy` is a Go-based TUI agent that emits an OSC escape sequence
+/// (`]9;Antigravity CLI is ready for input`) when its input prompt is
+/// active, followed by a `>` prompt line after the separator bar. We detect
+/// readiness via either the stripped OSC marker or the `>` glyph at the
+/// start of a line near the bottom of the screen — the same heuristic
+/// Claude Code uses for its own `>` prompt (`has_greater_than_or_slim_box`).
+/// Bracketed paste is fine: agy is a Go binary and handles paste envelopes
+/// as one block, so we reuse the same delivery path as ClaudeAdapter.
+pub struct AgyAdapter;
+
+impl Adapter for AgyAdapter {
+    fn name(&self) -> &'static str {
+        "agy"
+    }
+
+    fn format_message(&self, msg: &Message) -> Vec<u8> {
+        bracketed_paste_envelope(msg)
+    }
+
+    fn idle_ms_before_inject(&self) -> u64 {
+        750
+    }
+
+    /// agy shows `Antigravity CLI is ready for input` (OSC-stripped) OR
+    /// a `>` as the first meaningful character on a line near the bottom
+    /// once its input prompt is live. We check for either signal so that
+    /// the adapter works whether the OSC sequence has been stripped or not.
+    fn is_prompt_ready(&self, screen_tail: &str) -> bool {
+        if screen_tail.contains("Antigravity CLI is ready for input") {
+            return true;
+        }
+        // Fall back to the same `>` / slim-box pattern as ClaudeAdapter.
+        strip::has_greater_than_or_slim_box(screen_tail)
+    }
+}
+
 /// Aider adapter. Aider has a readline-style prompt so plain envelope + CR
 /// is the cleanest delivery — bracketed paste would render as visible
 /// markers in the buffer.
@@ -209,6 +247,8 @@ pub fn pick(program: &str) -> Box<dyn Adapter> {
         // Order matters: must check "opencode" before any partial match
         // for "code" (none today, but defensive). Check before generic.
         Box::new(OpencodeAdapter)
+    } else if p.contains("agy") {
+        Box::new(AgyAdapter)
     } else if p.contains("aider") {
         Box::new(AiderAdapter)
     } else {
@@ -273,6 +313,8 @@ mod tests {
         assert_eq!(pick("aider").name(), "aider");
         assert_eq!(pick("opencode").name(), "opencode");
         assert_eq!(pick("/usr/local/bin/opencode --tui").name(), "opencode");
+        assert_eq!(pick("agy").name(), "agy");
+        assert_eq!(pick("/usr/local/bin/agy --dangerously-skip-permissions").name(), "agy");
         assert_eq!(pick("vim").name(), "generic");
     }
 
@@ -395,5 +437,43 @@ codex ran tests, all green.
         assert!(GenericAdapter.is_prompt_ready(THINKING));
         assert!(AiderAdapter.is_prompt_ready(THINKING));
         assert!(GenericAdapter.is_prompt_ready(""));
+    }
+
+    // --- AgyAdapter tests ---------------------------------------------------
+
+    /// agy ready via the OSC-stripped `Antigravity CLI is ready for input` marker.
+    #[test]
+    fn agy_prompt_ready_via_osc_marker() {
+        let screen = "some output\nAntigravity CLI is ready for input\n────────\n > ";
+        assert!(AgyAdapter.is_prompt_ready(screen));
+    }
+
+    /// agy ready via the `>` prompt line (same heuristic as ClaudeAdapter).
+    #[test]
+    fn agy_prompt_ready_via_greater_than() {
+        let screen = "\
+● Done processing.\n\
+\n\
+────────────────────────────────────────\n\
+ >\n\
+────────────────────────────────────────\n\
+  ? for shortcuts";
+        assert!(AgyAdapter.is_prompt_ready(screen));
+    }
+
+    /// agy NOT ready while the spinner / Braille generator is active.
+    #[test]
+    fn agy_prompt_not_ready_mid_spinner() {
+        let screen = "⣷ Generating...\n  working on it\n  still thinking";
+        assert!(!AgyAdapter.is_prompt_ready(screen));
+    }
+
+    #[test]
+    fn agy_uses_bracketed_paste_and_idle_gating() {
+        let bytes = AgyAdapter.format_message(&msg("hi"));
+        assert!(bytes.starts_with(b"\x1b[200~"));
+        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
+        assert_eq!(bytes.last(), Some(&b'\r'));
+        assert_eq!(AgyAdapter.idle_ms_before_inject(), 750);
     }
 }

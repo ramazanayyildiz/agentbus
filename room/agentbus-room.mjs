@@ -235,7 +235,7 @@ function coalesceLines(lines) {
 // ── Agent Spec Parsing (per-program launch) ───────────────────────────────────
 
 /** Programs the hub knows how to launch. */
-const VALID_PROGRAMS = ["claude", "codex", "gemini"];
+const VALID_PROGRAMS = ["claude", "codex", "gemini", "agy"];
 
 // Agent name validation pattern — prevents shell metacharacter injection via names.
 const AGENT_NAME_RE = /^[A-Za-z0-9_-]+$/;
@@ -309,6 +309,38 @@ function buildGeminiArgs(busId, transcriptFile, prompt, { resume = false } = {})
     "--transcript", transcriptFile,
     "--",
     ...geminiArgs,
+  ];
+}
+
+/**
+ * Build the exact `agentbus run` argv for an AGY agent. Pure function — testable.
+ *
+ * VALIDATED AGY RECIPE (live-probed — replicate exactly):
+ *   agy --dangerously-skip-permissions -i "<ROOM_PROMPT>"
+ *  - --dangerously-skip-permissions  = auto-approve all tools (so it can run `agentbus send`).
+ *  - -i "<ROOM_PROMPT>"              = initial interactive prompt for trust establishment.
+ *    Passed as a SINGLE argv element (spawn, no shell) so it is never interpolated.
+ *  - No MCP flag needed (agy has no --allowed-mcp-server-names equivalent; boots normally).
+ *  - No isolated home needed (simpler than codex).
+ *  - Runs in the user's cwd = launchDir (spawnRunner already sets cwd: launchDir).
+ *  - No temp files to create/clean (like gemini).
+ *  - RESUME: agy supports `--continue` / `-c` (continues most recent conversation) and
+ *    `--conversation <id>` (resume by ID). We use `--continue` as the best-effort approach
+ *    (same rationale as gemini's `-r latest`: no id-capture needed at session launch time).
+ *    NOTE: `--conversation <id>` would be more precise but requires capturing the conversation
+ *    id from the agy session output — use `--continue` until that plumbing is wired up.
+ */
+function buildAgyArgs(busId, transcriptFile, prompt, { resume = false } = {}) {
+  const agyArgs = resume
+    ? ["agy", "--dangerously-skip-permissions", "--continue", "-i", prompt]
+    : ["agy", "--dangerously-skip-permissions", "-i", prompt];
+  return [
+    "run",
+    "--name", busId,
+    "--program", "agy",
+    "--transcript", transcriptFile,
+    "--",
+    ...agyArgs,
   ];
 }
 
@@ -848,9 +880,40 @@ function launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDi
 }
 
 /**
+ * Launch an AGY agent with agentbus run.
+ * Returns the SAME uniform shape as the claude/codex/gemini paths
+ * ({ child, transcriptFile, spFile, emptyMcp, codexHome, claudeSessionId }) with every
+ * program-specific field null — agy has NO temp files, NO isolated home, NO session id.
+ * This uniformity means spawnMember's destructure, the resumeInfo bookkeeping, and
+ * teardownChild's guards all just work without special-casing.
+ *
+ * Recipe + flag rationale: see buildAgyArgs. The room system prompt is delivered as the
+ * `-i` initial interactive prompt (built via the SAME generateSystemPrompt the others use, so
+ * agy replies `--from <busId> --to <roomBus>` exactly like claude/codex/gemini).
+ * `resume:true` adds `--continue` for agy's best-effort session resume.
+ */
+function launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume = false } = {}) {
+  const transcriptFile = path.join(transcriptDir, `room-transcript-${agentName}-${roomId}.txt`);
+  const prompt = generateSystemPrompt(agentName, allAgents, roomId);
+  // (A) Register on the bus under the namespaced busId, not the raw display name.
+  const busId = agentBusId(roomId, agentName);
+  const args = buildAgyArgs(busId, transcriptFile, prompt, { resume });
+
+  printSystemMsg(`Launching agy agent ${agentName} in ${launchDir}${resume ? " (resuming --continue)" : ""}...`);
+
+  // No extra env (no isolated home) — runs in the user's cwd (launchDir).
+  const child = spawnRunner(agentName, args, launchDir, null);
+
+  // Uniform null-shape so spawnMember/teardownChild need no agy special-casing:
+  // no spFile/emptyMcp (claude-only), no codexHome (codex-only), no claudeSessionId.
+  return { child, transcriptFile, spFile: null, emptyMcp: null, codexHome: null, claudeSessionId: null };
+}
+
+/**
  * Per-program launch dispatcher. `resume` carries optional resume handles:
  *   { codex: true }            → relaunch codex via `codex resume --last --all`
  *   { gemini: true }           → relaunch gemini via `gemini -r latest`
+ *   { agy: true }              → relaunch agy via `agy --continue`
  *   { claudeSessionId: <uuid> } → relaunch claude via `claude --resume <uuid>`
  * Absent/empty → fresh launch. Keeps launchAgents() agnostic of program details.
  */
@@ -860,6 +923,9 @@ function launchAgent(agentName, program, allAgents, roomId, launchDir, transcrip
   }
   if (program === "gemini") {
     return launchGeminiAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.gemini });
+  }
+  if (program === "agy") {
+    return launchAgyAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resume: !!resume.agy });
   }
   // default + 'claude'
   return launchClaudeAgent(agentName, allAgents, roomId, launchDir, transcriptDir, { resumeSessionId: resume.claudeSessionId || null });
@@ -1492,7 +1558,7 @@ class RoomHub {
           "  @<agent> <msg>        — address a single agent (Tab completes @names)\n" +
           "  /resume               — unblock circuit-breaker\n" +
           "  /who                  — list members + their programs\n" +
-          "  /add <name>[:program] — add an agent (program = claude|codex|gemini; default claude)\n" +
+          "  /add <name>[:program] — add an agent (program = claude|codex|gemini|agy; default claude)\n" +
           "  /kick <name>          — remove an agent from the room\n" +
           "  paste multi-line text — pasted blocks are sent as ONE message (not one per line)\n" +
           "Reconnect (from the shell, after the room is closed):\n" +
@@ -1512,7 +1578,7 @@ class RoomHub {
    */
   cmdAdd(arg) {
     if (!arg) {
-      printSystemMsg("usage: /add <name>[:<program>]   (program = claude|codex|gemini; default claude)");
+      printSystemMsg("usage: /add <name>[:<program>]   (program = claude|codex|gemini|agy; default claude)");
       return;
     }
     const spec = parseAgentSpec(arg);
@@ -1873,11 +1939,14 @@ class RoomHub {
         this.programs = {};
         for (const a of loaded.agents) {
           this.programs[a.name] = a.program;
-          // codex → resume:true; gemini → resume:true (`-r latest`); claude → restore its pinned session id.
+          // codex → resume:true; gemini → resume:true (`-r latest`); agy → resume:true (`--continue`);
+          // claude → restore its pinned session id.
           resumeHandles[a.name] = a.program === "codex"
             ? { codex: true }
             : a.program === "gemini"
             ? { gemini: true }
+            : a.program === "agy"
+            ? { agy: true }
             : { claudeSessionId: a.claudeSessionId || null };
         }
         printSystemMsg(`Resuming room "${this.roomId}" with ${this.members.length} agent(s): ${this.members.join(", ")}`);
@@ -2192,6 +2261,12 @@ async function runSelfTest() {
     assert("spec gem:gemini: program", gemini.program === "gemini");
     assert("spec gem:gemini: no error", !gemini.error);
 
+    // name:agy accepted (fourth program)
+    const agy = parseAgentSpec("a:agy");
+    assert("spec a:agy: name", agy.name === "a");
+    assert("spec a:agy: program", agy.program === "agy");
+    assert("spec a:agy: no error", !agy.error);
+
     // unknown program rejected
     const bad = parseAgentSpec("x:perl");
     assert("spec x:perl: rejected with error", typeof bad.error === "string" && bad.error.includes("perl"));
@@ -2261,6 +2336,44 @@ async function runSelfTest() {
     assert("gemini args (resume): -r latest", resumed[rIdx + 1] === "latest");
     assert("gemini args (resume): still has __none__ mcp name", resumed[resumed.indexOf("--allowed-mcp-server-names") + 1] === "__none__");
     assert("gemini args (resume): prompt still last", resumed[resumed.length - 1] === prompt);
+  }
+
+  // ── buildAgyArgs tests (validated recipe) ─────────────────────────────────
+
+  process.stdout.write(`\n${C.BOLD}buildAgyArgs (validated recipe)${C.RESET}\n`);
+
+  {
+    const busId = "r1-a";
+    const transcript = "/tmp/room-transcript-a-r1.txt";
+    const prompt = "You are r1-a. Reply via agentbus send --from r1-a --to room-r1 ...";
+
+    // Fresh launch
+    const fresh = buildAgyArgs(busId, transcript, prompt);
+    assert("agy args: starts with run", fresh[0] === "run");
+    assert("agy args: --name busId", fresh.includes("--name") && fresh[fresh.indexOf("--name") + 1] === busId);
+    assert("agy args: --program agy", fresh[fresh.indexOf("--program") + 1] === "agy");
+    assert("agy args: --transcript present", fresh[fresh.indexOf("--transcript") + 1] === transcript);
+    assert("agy args: has -- separator before agy", fresh.includes("--") && fresh[fresh.indexOf("--") + 1] === "agy");
+    assert("agy args: --dangerously-skip-permissions present", fresh.includes("--dangerously-skip-permissions"));
+    // Prompt delivered as the -i initial interactive prompt, as a SINGLE verbatim argv element.
+    const iIdx = fresh.indexOf("-i");
+    assert("agy args: -i present", iIdx !== -1);
+    assert("agy args: prompt is verbatim argv element after -i", fresh[iIdx + 1] === prompt);
+    assert("agy args: prompt is the last arg", fresh[fresh.length - 1] === prompt);
+    // Fresh launch must NOT carry --continue.
+    assert("agy args (fresh): no --continue flag", !fresh.includes("--continue"));
+
+    // Resume launch adds `--continue`
+    const resumed = buildAgyArgs(busId, transcript, prompt, { resume: true });
+    assert("agy args (resume): --continue present", resumed.includes("--continue"));
+    // --dangerously-skip-permissions still present on resume.
+    assert("agy args (resume): --dangerously-skip-permissions still present", resumed.includes("--dangerously-skip-permissions"));
+    // Prompt still the last arg on resume.
+    assert("agy args (resume): prompt still last", resumed[resumed.length - 1] === prompt);
+    // --continue appears BEFORE -i (i.e., before the prompt).
+    const continueIdx = resumed.indexOf("--continue");
+    const iIdxR = resumed.indexOf("-i");
+    assert("agy args (resume): --continue before -i", continueIdx < iIdxR);
   }
 
   // ── Codex AGENTS.md == Claude system prompt (consistency) ─────────────────
@@ -2392,6 +2505,10 @@ async function runSelfTest() {
     assert("/add gem:gemini → name", addGemini.name === "gem");
     assert("/add gem:gemini → gemini", addGemini.program === "gemini");
 
+    const addAgy = parseAgentSpec("a:agy");
+    assert("/add a:agy → name", addAgy.name === "a");
+    assert("/add a:agy → agy", addAgy.program === "agy");
+
     // bad program rejected → usage path
     const addBad = parseAgentSpec("x:perl");
     assert("/add x:perl → error", typeof addBad.error === "string");
@@ -2489,6 +2606,9 @@ async function runSelfTest() {
     // gemini is now a VALID program → preserved, not coerced.
     const gem = deserializeState({ roomId: "r1", agents: [{ name: "g", program: "gemini" }] });
     assert("deserializeState: preserves gemini program", gem.agents[0].program === "gemini");
+    // agy is now a VALID program → preserved, not coerced.
+    const agyDs = deserializeState({ roomId: "r1", agents: [{ name: "a", program: "agy" }] });
+    assert("deserializeState: preserves agy program", agyDs.agents[0].program === "agy");
 
     // buildReplaySql: tail-capped, DESC, excludes roomBus relay copies, escapes quotes.
     const sql = buildReplaySql("r1", "room-r1", 150);
@@ -2581,8 +2701,8 @@ async function main() {
   if (!opts.roomId) {
     process.stderr.write(
       "Usage: agentbus-room.mjs <room-id> [--agents name[:program],...] [--cb-max 6] [--launch-dir <dir>] [--no-agents] [--resume]\n" +
-      "       --agents accepts `name:program` (program = claude|codex|gemini); a bare name defaults to claude.\n" +
-      "       e.g. --agents claude-A,codex-A:codex\n" +
+      "       --agents accepts `name:program` (program = claude|codex|gemini|agy); a bare name defaults to claude.\n" +
+      "       e.g. --agents claude-A,codex-A:codex  or  --agents claude-A,gem:gemini,a:agy\n" +
       "       --resume    reconnect to a closed room: replay history + restore each agent's session\n" +
       "       --no-agents attach to agents already running (hub-died-but-agents-survived reconnect)\n" +
       "       agentbus-room.mjs --self-test\n"
