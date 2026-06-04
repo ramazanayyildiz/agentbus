@@ -55,6 +55,40 @@ while [[ $# -gt 0 ]]; do
     --help|-h)
       grep '^#' "$0" | grep -v '^#!/' | sed 's/^# \?//'
       exit 0 ;;
+    --list|-l)
+      # List sessions for this program and let the user pick one
+      case "$PROGRAM" in
+        codex)
+          echo "Codex sessions:" >&2
+          codex --list-sessions 2>&1
+          echo "" >&2
+          printf "Session ID to resume (or Enter to skip): " >&2
+          read -r SESSION_ID
+          [[ -n "$SESSION_ID" ]] && REMAINING+=(--conversation "$SESSION_ID")
+          ;;
+        agy)
+          echo "agy sessions:" >&2
+          agy --list-sessions 2>&1 || echo "(agy --list-sessions not supported)" >&2
+          printf "Conversation ID to resume (or Enter to skip): " >&2
+          read -r SESSION_ID
+          [[ -n "$SESSION_ID" ]] && REMAINING+=(--conversation "$SESSION_ID")
+          ;;
+        claude)
+          PROJ_DIR="$HOME/.claude/projects/$(echo "$PWD" | sed 's|/|-|g')"
+          echo "Claude sessions in current project:" >&2
+          ls -lt "$PROJ_DIR"/*.jsonl 2>/dev/null | awk '{print NR". "$NF}' | sed "s|$PROJ_DIR/||;s|\.jsonl||" | head -10 >&2 || echo "(none found)" >&2
+          printf "Session ID to resume (or Enter to skip): " >&2
+          read -r SESSION_ID
+          [[ -n "$SESSION_ID" ]] && REMAINING+=(--conversation "$SESSION_ID")
+          ;;
+        gemini)
+          echo "Gemini: use --continue for latest session" >&2
+          printf "Resume latest? [y/N]: " >&2
+          read -r YN
+          [[ "$YN" =~ ^[Yy] ]] && REMAINING+=(--continue)
+          ;;
+      esac
+      shift ;;  # consume --list
     --no-seed)      NO_SEED=1; shift ;;
     --seed)         CUSTOM_SEED="$2"; shift 2 ;;
     --seed=*)       CUSTOM_SEED="${1#--seed=}"; shift ;;
@@ -96,6 +130,43 @@ fi
 echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
 "$AB" start 2>/dev/null || true
 
+# ── Run and show resume command on exit ───────────────────────────────────────
+# Capture the session ID after the agent exits (program-specific lookup).
+show_resume() {
+  local name="$1" program="$2"
+  echo "" >&2
+  echo "────────────────────────────────────────────" >&2
+  case "$program" in
+    codex)
+      local id
+      id=$(codex --list-sessions 2>/dev/null | awk 'NR==2{print $1}')
+      if [[ -n "$id" ]]; then
+        echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
+      else
+        echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
+      fi ;;
+    claude)
+      local id
+      id=$(ls -t "$HOME/.claude/projects/"*"/"*.jsonl 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.jsonl//')
+      if [[ -n "$id" ]]; then
+        echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
+      else
+        echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
+      fi ;;
+    agy)
+      local id
+      id=$(agy --list-sessions 2>/dev/null | awk 'NR==1{print $1}')
+      if [[ -n "$id" ]]; then
+        echo "  To resume: agentbus-agent ${name}:${program} --conversation $id" >&2
+      else
+        echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
+      fi ;;
+    gemini)
+      echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2 ;;
+  esac
+  echo "────────────────────────────────────────────" >&2
+}
+
 # ── Launch with program-specific flags ────────────────────────────────────────
 case "$PROGRAM" in
 
@@ -113,10 +184,11 @@ case "$PROGRAM" in
     EMPTY_MCP="$(mktemp /tmp/agentbus-agent-empty-mcp.XXXXXX.json)"
     echo '{"mcpServers":{}}' > "$EMPTY_MCP"
     trap 'rm -f "$EMPTY_MCP"' EXIT
-    exec "$AB" run --name "$NAME" --program claude \
+    "$AB" run --name "$NAME" --program claude \
       -- claude --dangerously-skip-permissions \
                  --strict-mcp-config --mcp-config "$EMPTY_MCP" \
                  "${CLAUDE_RESUME[@]}" "${CLAUDE_EXTRA[@]}"
+    show_resume "$NAME" "$PROGRAM"
     ;;
 
   codex)
@@ -133,23 +205,24 @@ case "$PROGRAM" in
       esac
     done
     if [[ -n "$CODEX_RESUME_ID" && "$CODEX_RESUME_ID" != "__last__" ]]; then
-      exec "$AB" run --name "$NAME" --program codex \
+      "$AB" run --name "$NAME" --program codex \
         -- codex resume "$CODEX_RESUME_ID" \
                   --dangerously-bypass-approvals-and-sandbox \
                   --dangerously-bypass-hook-trust \
                   "${CODEX_EXTRA[@]}"
     elif [[ "$CODEX_RESUME_ID" == "__last__" ]]; then
-      exec "$AB" run --name "$NAME" --program codex \
+      "$AB" run --name "$NAME" --program codex \
         -- codex resume --last \
                   --dangerously-bypass-approvals-and-sandbox \
                   --dangerously-bypass-hook-trust \
                   "${CODEX_EXTRA[@]}"
     else
-      exec "$AB" run --name "$NAME" --program codex \
+      "$AB" run --name "$NAME" --program codex \
         -- codex --dangerously-bypass-approvals-and-sandbox \
                   --dangerously-bypass-hook-trust \
                   "${CODEX_EXTRA[@]}"
     fi
+    show_resume "$NAME" "$PROGRAM"
     ;;
 
   gemini)
@@ -163,17 +236,19 @@ case "$PROGRAM" in
         *)                GEMINI_EXTRA+=("$1"); shift ;;
       esac
     done
-    exec "$AB" run --name "$NAME" --program gemini \
+    "$AB" run --name "$NAME" --program gemini \
       -- gemini --yolo --skip-trust \
                  --allowed-mcp-server-names __none__ \
                  "${GEMINI_RESUME[@]}" "${GEMINI_EXTRA[@]}"
+    show_resume "$NAME" "$PROGRAM"
     ;;
 
   agy)
     # --conversation and --continue are native agy flags — pass through as-is
-    exec "$AB" run --name "$NAME" --program agy \
+    "$AB" run --name "$NAME" --program agy \
       -- agy --dangerously-skip-permissions \
               "$@"
+    show_resume "$NAME" "$PROGRAM"
     ;;
 
 esac
