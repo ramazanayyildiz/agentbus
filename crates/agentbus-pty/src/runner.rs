@@ -58,7 +58,11 @@ const SCREEN_TAIL_BYTES: usize = 8 * 1024;
 /// source policy later (e.g. rate limit bus injections).
 enum PtyWrite {
     UserStdin(Vec<u8>),
+    /// Body of a bus-injected message (bracketed-paste content, no trailing \r).
     BusMessage(Vec<u8>),
+    /// A deferred Enter (\r) sent ~50ms after BusMessage so the app has time
+    /// to process the paste-end marker before seeing the submit keystroke.
+    BusEnter,
 }
 
 impl PtyRunner {
@@ -188,12 +192,13 @@ impl PtyRunner {
             // spawn_blocking gives us a real OS thread which is appropriate
             // because the underlying PTY writer is a synchronous file handle.
             while let Some(item) = write_rx.blocking_recv() {
-                let bytes = match &item {
+                let bytes: &[u8] = match &item {
                     PtyWrite::UserStdin(b) => b.as_slice(),
                     PtyWrite::BusMessage(b) => {
                         debug!("injecting {} bytes from bus into PTY", b.len());
                         b.as_slice()
                     }
+                    PtyWrite::BusEnter => b"\r",
                 };
                 if let Err(e) = pty_writer_task.write_all(bytes) {
                     warn!("pty write failed: {}", e);
@@ -351,6 +356,7 @@ impl PtyRunner {
                     &screen_tail_for_bus,
                     process_start,
                     idle_threshold,
+                    &agent_name_for_bus,
                 )
                 .await;
                 match res {
@@ -504,6 +510,7 @@ async fn run_bus_loop(
     screen_tail: &Arc<std::sync::Mutex<Vec<u8>>>,
     process_start: Instant,
     idle_threshold: u64,
+    agent_name: &str,
 ) -> InnerExit {
     loop {
         let req = BusRequest::Read {
@@ -596,9 +603,47 @@ async fn run_bus_loop(
                     );
                 }
 
-                let bytes = adapter.format_message(&message);
+                // Append a reply hint so the agent always knows how to respond,
+                // even after context compaction or model restart.
+                let mut enriched = message.clone();
+                enriched.body = format!(
+                    "{}\n\nTo reply: agentbus send --from {} --to {} --msg-type response \"your reply here\"",
+                    message.body,
+                    agent_name,
+                    message.from,
+                );
+                let bytes = adapter.format_message(&enriched);
+                let needs_enter = adapter.uses_bracketed_paste();
                 if bus_tx.send(PtyWrite::BusMessage(bytes)).await.is_err() {
                     return InnerExit::Shutdown;
+                }
+                // Bracketed-paste adapters omit the trailing \r from format_message.
+                // Send it as a separate write 500 ms later so the app has time to
+                // process the paste-end marker (\x1b[201~) before seeing Enter.
+                // 500ms: Claude Code collapses large pastes into [Text#1] /
+                // [Pasted Text: N chars] before they're submittable — this
+                // render step takes longer than 200ms for long messages.
+                if needs_enter {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Snapshot output timestamp BEFORE the Enter. A successful submit
+                    // always produces output (the agent starts responding). If the
+                    // Enter doesn't land (message sits unsubmitted at the prompt — the
+                    // "stuck input" failure), no output appears and the snapshot stays
+                    // unchanged. Detect that and re-send Enter once as a recovery tap.
+                    let before = last_output_ms.load(Ordering::Relaxed);
+                    if bus_tx.send(PtyWrite::BusEnter).await.is_err() {
+                        return InnerExit::Shutdown;
+                    }
+                    // Stuck-input guard: wait, and if the agent produced no new output,
+                    // the Enter was swallowed — tap it once more.
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let after = last_output_ms.load(Ordering::Relaxed);
+                    if after == before {
+                        debug!("stuck-input guard: no output after Enter, re-sending \\r");
+                        if bus_tx.send(PtyWrite::BusEnter).await.is_err() {
+                            return InnerExit::Shutdown;
+                        }
+                    }
                 }
             }
             Ok(BusResponse::Ok { data }) => {
