@@ -1,7 +1,7 @@
 use agentbus_core::{socket_path, BusRequest, BusResponse};
 use clap::{Parser, Subcommand};
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -18,7 +18,11 @@ enum Commands {
     /// Start the daemon
     Start,
 
-    /// Register this agent
+    /// Register this agent.
+    ///
+    /// By default this is a one-shot registration check: the daemon marks the
+    /// agent disconnected again when this CLI exits. Use --keepalive when you
+    /// want the name to remain active/addressable on the bus.
     Register {
         /// Agent name
         #[arg(long)]
@@ -35,6 +39,10 @@ enum Commands {
         /// Project name (optional)
         #[arg(long, default_value = "default")]
         project: String,
+
+        /// Keep this process connected so the agent remains active/addressable.
+        #[arg(long)]
+        keepalive: bool,
     },
 
     /// List all agents
@@ -177,7 +185,8 @@ fn main() -> anyhow::Result<()> {
             program,
             model,
             project,
-        } => cmd_register(&name, &program, &model, &project)?,
+            keepalive,
+        } => cmd_register(&name, &program, &model, &project, keepalive)?,
         Commands::List => cmd_list()?,
         Commands::Send {
             from,
@@ -352,15 +361,54 @@ fn cmd_start() -> anyhow::Result<()> {
         ));
     }
 
-    let child = std::process::Command::new(&daemon_path)
-        .spawn();
+    // Redirect daemon output to ~/.agentbus/daemon.log and detach it into its
+    // own session. Without this, daemon log lines print into whichever
+    // terminal happened to run `agentbus start` first — including straight
+    // into a TUI agent's input area.
+    let log_path = bus_dir.join("daemon.log");
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let log_file_err = log_file.try_clone()?;
+
+    let mut cmd = std::process::Command::new(&daemon_path);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(log_file)
+        .stderr(log_file_err);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // own process group — survives terminal close, no TTY signals
+    }
+    let child = cmd.spawn();
 
     match child {
         Ok(_) => {
-            println!("Daemon started");
-            // Give it a moment to initialize
-            std::thread::sleep(Duration::from_millis(100));
-            Ok(())
+            // Poll for the socket to be bound rather than sleeping a fixed
+            // 100ms. A caller (agentbus-agent → agentbus run) connects
+            // immediately after this returns; without waiting for the socket
+            // it races and fails with "No such file or directory".
+            let sock_path = socket_path()?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut ready = false;
+            while std::time::Instant::now() < deadline {
+                // Truly ready = socket exists AND accepts a connection.
+                if sock_path.exists() && UnixStream::connect(&sock_path).is_ok() {
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if ready {
+                println!("Daemon started");
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "daemon spawned but socket not ready after 5s at {:?}",
+                    sock_path
+                ))
+            }
         }
         Err(e) => Err(anyhow::anyhow!("Failed to start daemon: {}", e)),
     }
@@ -399,7 +447,13 @@ fn send_request(req: &BusRequest) -> anyhow::Result<BusResponse> {
     read_response(&stream)
 }
 
-fn cmd_register(name: &str, program: &str, model: &str, project: &str) -> anyhow::Result<()> {
+fn cmd_register(
+    name: &str,
+    program: &str,
+    model: &str,
+    project: &str,
+    keepalive: bool,
+) -> anyhow::Result<()> {
     let req = BusRequest::Register {
         name: name.to_string(),
         program: program.to_string(),
@@ -407,14 +461,70 @@ fn cmd_register(name: &str, program: &str, model: &str, project: &str) -> anyhow
         project: project.to_string(),
     };
 
+    if keepalive {
+        return cmd_register_keepalive(&req);
+    }
+
     let resp = send_request(&req)?;
     match resp {
         BusResponse::Ok { data } => {
             println!("Registered: {}", serde_json::to_string_pretty(&data)?);
+            eprintln!(
+                "Note: this was a one-shot registration; the agent will become disconnected when this command exits. Use `agentbus register --keepalive ...` to stay active/addressable."
+            );
             Ok(())
         }
         BusResponse::Error { message } => Err(anyhow::anyhow!(message)),
         _ => Err(anyhow::anyhow!("Unexpected response")),
+    }
+}
+
+fn cmd_register_keepalive(req: &BusRequest) -> anyhow::Result<()> {
+    let mut stream = connect()?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+
+    let req_str = serde_json::to_string(req)?;
+    stream.write_all(format!("{}\n", req_str).as_bytes())?;
+
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let resp: BusResponse = serde_json::from_str(line.trim())?;
+    match resp {
+        BusResponse::Ok { data } => {
+            println!("Registered: {}", serde_json::to_string_pretty(&data)?);
+            eprintln!("Keepalive active; press Ctrl+C to disconnect.");
+        }
+        BusResponse::Error { message } => return Err(anyhow::anyhow!(message)),
+        BusResponse::Message { .. } => return Err(anyhow::anyhow!("Unexpected message response")),
+    }
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => {
+                eprintln!("Disconnected from daemon.");
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+            Err(e) => return Err(anyhow::anyhow!("Keepalive read error: {}", e)),
+        }
+
+        let response: BusResponse = serde_json::from_str(line.trim())?;
+        match response {
+            BusResponse::Message { message } => {
+                println!("Message from {}: {}", message.from, message.body);
+            }
+            BusResponse::Ok { data } => {
+                println!("{}", serde_json::to_string_pretty(&data)?);
+            }
+            BusResponse::Error { message } => {
+                eprintln!("Bus error: {}", message);
+            }
+        }
     }
 }
 

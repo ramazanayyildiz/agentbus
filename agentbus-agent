@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # agentbus-agent — launch a single agent on the bus with the right flags.
 # Usage: agentbus-agent [<name>][:<program>] [options] [extra CLI args...]
-# Programs: claude (default) | codex | gemini | agy
+# Programs: claude (default) | codex | gemini | opencode | agy | qodercli | cmd
 #
 # Options (intercepted before the underlying CLI sees them):
 #   --conversation <id>   resume a specific session by id (works on all programs)
@@ -18,6 +18,7 @@
 #   agentbus-agent --attach <name>    re-attach to a detached agent's live TUI (Ctrl-b d to detach again)
 #   agentbus-agent --kill <name>      stop a detached agent + close it on the bus
 #   agentbus-agent --detached         list all detached agentbus-agent tmux sessions
+#   agentbus-agent --spawn-help       agent-facing guide: how to spawn/manage other agents
 #
 # If no name given, a unique id is generated (e.g. "claude-a3f2").
 # If no --seed/--no-seed given, an auto-seed is sent explaining AgentBus usage.
@@ -37,6 +38,77 @@ AB="${AGENTBUS_BIN:-$HOME/.local/bin/agentbus}"
 
 sess_name() { echo "agentbus-${1%%:*}"; }  # strip :program if present
 
+# ── Bug #1+#2+#3 helpers — per-name CODEX_HOME isolation & session listing ────
+#
+# Each standalone codex agent gets its own stable CODEX_HOME at
+#   ~/.agentbus/agent-codex-<name>/
+# mirroring what the room hub does per (roomId, agentName).
+# Auth files are symlinked from the real ~/.codex; config.toml trusts PWD.
+# Sessions accumulate here, so `codex resume --last` always finds the right one
+# (Bug #2: no per-name isolation → wrong/random session on --continue).
+
+codex_home_for() { echo "$HOME/.agentbus/agent-codex-${1}"; }
+
+setup_codex_home() {
+  local name="$1" launchdir="$2"
+  local home; home="$(codex_home_for "$name")"
+  mkdir -p "$home"
+  local real="$HOME/.codex"
+  # Symlink auth/model files so codex can authenticate; guard each individually.
+  for f in auth.json accounts version.json models_cache.json; do
+    [ -e "$real/$f" ] && [ ! -e "$home/$f" ] && ln -s "$real/$f" "$home/$f" 2>/dev/null || true
+  done
+  # config.toml: trust launchDir + model (no MCP servers = fast boot).
+  # Rewritten each launch (cheap, idempotent — handles moved launchDir).
+  cat > "$home/config.toml" <<EOF
+model = "gpt-5.5"
+model_reasoning_effort = "low"
+[projects."${launchdir}"]
+trust_level = "trusted"
+EOF
+  echo "$home"
+}
+
+# Bug #1: `codex --list-sessions` doesn't exist.
+# Real sessions live at $CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl
+list_codex_sessions() {
+  local home="$1"
+  local sess_dir="$home/sessions"
+  [ -d "$sess_dir" ] || sess_dir="$HOME/.codex/sessions"
+  if ! find "$sess_dir" -name "rollout-*.jsonl" -type f 2>/dev/null | grep -q .; then
+    echo "  (no sessions found in $sess_dir)" >&2; return
+  fi
+  find "$sess_dir" -name "rollout-*.jsonl" -type f 2>/dev/null | sort -r | head -10 | while read -r f; do
+    local uuid; uuid=$(basename "$f" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    printf "  %s  (%s)\n" "$uuid" "$(basename "$f")" >&2
+  done
+}
+
+# Bug #3: resolve the most recent session ID from CODEX_HOME for show_resume/transcript.
+latest_codex_session_id() {
+  local home="$1"
+  local sess_dir="$home/sessions"
+  [ -d "$sess_dir" ] || sess_dir="$HOME/.codex/sessions"
+  find "$sess_dir" -name "rollout-*.jsonl" -type f 2>/dev/null | sort -r | head -1 \
+    | xargs -I{} basename {} 2>/dev/null \
+    | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' || true
+}
+
+# Bug #3: transcript path — written by `agentbus run --transcript`.
+# Codex: under CODEX_HOME so it's co-located with its sessions.
+# Others: under ~/.agentbus/transcripts/ with timestamped name.
+TRANSCRIPT=""
+setup_transcript() {
+  local name="$1" program="$2" home="${3:-}"
+  local ts; ts="$(date +%Y%m%d-%H%M%S)"
+  if [[ "$program" == "codex" && -n "$home" ]]; then
+    TRANSCRIPT="$home/transcript-${name}-${ts}.txt"
+  else
+    mkdir -p "$HOME/.agentbus/transcripts"
+    TRANSCRIPT="$HOME/.agentbus/transcripts/${program}-${name}-${ts}.txt"
+  fi
+}
+
 # ── Detach control modes (handled before normal launch) ───────────────────────
 case "${1:-}" in
   --attach|-a)
@@ -52,6 +124,46 @@ case "${1:-}" in
     echo "Detached agentbus agents:" >&2
     tmux ls 2>/dev/null | grep '^agentbus-' || echo "  (none)" >&2
     exit 0 ;;
+  --spawn-help)
+    # Agent-facing instructions: how to spawn, message, and manage other agents.
+    # Written for an AI agent to read and act on (run: agentbus-agent --spawn-help).
+    cat <<'SPAWNHELP'
+HOW TO SPAWN AND MANAGE AGENTS ON AGENTBUS
+
+SPAWN a new agent (detached — runs in background tmux, does not touch your terminal):
+  ~/.local/bin/agentbus-agent <name>:<program> --detach
+  Programs: claude | codex | gemini | opencode | agy | qodercli | cmd
+  Examples:
+    ~/.local/bin/agentbus-agent worker-1:codex --detach
+    ~/.local/bin/agentbus-agent reviewer:claude --detach
+  Name rules: pick a UNIQUE descriptive name. If the name is already active,
+  the command fails and suggests a free one (e.g. worker-1-2).
+
+GIVE IT A TASK (after ~10s boot time):
+  ~/.local/bin/agentbus send --from <your-name> --to worker-1 --msg-type request "your task here"
+  Include in the task message how you want the result reported back.
+
+RECEIVE ITS REPLY:
+  Replies arrive automatically in your terminal input, prefixed:
+    [agentbus from=worker-1 type=response] ...
+  You do NOT need to poll or run any read command.
+
+CHECK WHO IS ON THE BUS:
+  ~/.local/bin/agentbus list          # all agents + state (active = running now)
+
+STOP an agent you spawned:
+  ~/.local/bin/agentbus-agent --kill worker-1
+
+LIST your detached agents:
+  ~/.local/bin/agentbus-agent --detached
+
+RULES:
+- Spawn agents ONLY when your task genuinely needs parallel workers.
+- Always --detach (foreground would block your own terminal).
+- Kill agents you spawned when their work is done.
+- Do not spawn an agent with a name that is already active.
+SPAWNHELP
+    exit 0 ;;
 esac
 
 # ── Parse [name][:<program>] ──────────────────────────────────────────────────
@@ -63,6 +175,8 @@ else
   if [[ "$SPEC" == *:* ]]; then
     NAME="${SPEC%%:*}"; PROGRAM="${SPEC##*:}"
     [ -z "$PROGRAM" ] && PROGRAM="claude"
+  elif [[ "$SPEC" == "opencode" ]]; then
+    NAME="opencode"; PROGRAM="opencode"
   else
     NAME="$SPEC"; PROGRAM="claude"
   fi
@@ -85,9 +199,16 @@ while [[ $# -gt 0 ]]; do
     --no-seed)      NO_SEED=1; shift ;;
     --seed)         CUSTOM_SEED="$2"; shift 2 ;;
     --seed=*)       CUSTOM_SEED="${1#--seed=}"; shift ;;
+    # Tolerate bare 'continue' (common mistake for --continue). Without this it
+    # leaks through to the underlying CLI — e.g. claude treats a bare word after
+    # --mcp-config as a second config path and errors "MCP config file not found".
+    # NOTE: do NOT map bare 'resume' — `foo:codex resume <uuid>` is real codex syntax.
+    continue) REMAINING+=(--continue); shift ;;
     --list|-l)
       case "$PROGRAM" in
-        codex)  echo "Codex sessions:" >&2; codex --list-sessions 2>&1
+        codex)  CODEX_H="$(codex_home_for "$NAME")"
+                echo "Codex sessions for $NAME (most recent first):" >&2
+                list_codex_sessions "$CODEX_H"
                 printf "Session ID (Enter to skip): " >&2; read -r SID
                 [[ -n "$SID" ]] && REMAINING+=(--conversation "$SID") ;;
         agy)    echo "agy sessions:" >&2; agy --list-sessions 2>&1 || true
@@ -109,9 +230,32 @@ set -- "${REMAINING[@]}"
 
 # Validate
 case "$PROGRAM" in
-  claude|codex|gemini|agy) ;;
-  *) echo "error: unknown program '$PROGRAM' (choose: claude, codex, gemini, agy)" >&2; exit 1 ;;
+  claude|codex|gemini|opencode|agy|qodercli|cmd|exec) ;;
+  *) echo "error: unknown program '$PROGRAM' (choose: claude, codex, gemini, opencode, agy, qodercli, cmd)" >&2; exit 1 ;;
 esac
+
+# ── Name collision guard ──────────────────────────────────────────────────────
+# Two runners with the same name evict each other on the daemon in a loop
+# (each reconnect kicks the other out, ~every 250ms). Refuse to start if an
+# ACTIVE agent already holds this name, and suggest a free alternative.
+BUS_DB="$HOME/.agentbus/bus.db"
+if [[ -f "$BUS_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+  EXISTING_STATE="$(sqlite3 "$BUS_DB" "SELECT state FROM agents WHERE name='$NAME' LIMIT 1;" 2>/dev/null || true)"
+  if [[ "$EXISTING_STATE" == "active" ]]; then
+    # Find a free suffix: name-2, name-3, ...
+    SUGGEST=""
+    for i in 2 3 4 5 6 7 8 9; do
+      CAND="${NAME}-${i}"
+      ST="$(sqlite3 "$BUS_DB" "SELECT state FROM agents WHERE name='$CAND' LIMIT 1;" 2>/dev/null || true)"
+      if [[ "$ST" != "active" ]]; then SUGGEST="$CAND"; break; fi
+    done
+    echo "error: an agent named '$NAME' is already ACTIVE on the bus." >&2
+    echo "  Starting a second one would make them evict each other in a loop." >&2
+    [[ -n "$SUGGEST" ]] && echo "  Try: agentbus-agent ${SUGGEST}:${PROGRAM}" >&2
+    echo "  Or stop the existing one first (Ctrl+C in its terminal)." >&2
+    exit 1
+  fi
+fi
 
 # ── Auto-seed: explain AgentBus to the agent ──────────────────────────────────
 send_seed() {
@@ -136,6 +280,8 @@ HOW TO REPLY: run this shell command (replace SENDER with the from= value you sa
   ${AB} send --from ${NAME} --to SENDER --msg-type response \"your reply here\" \
 Example — if you got [agentbus from=atlas-coordinator-codex ...], reply with: \
   ${AB} send --from ${NAME} --to atlas-coordinator-codex --msg-type response \"your reply\" \
+TO SPAWN helper agents (only if your task needs parallel workers), first run: \
+  $HOME/.local/bin/agentbus-agent --spawn-help \
 IMPORTANT: do not explain agentbus to others. Just use it and reply. Be concise.}"
 fi
 
@@ -143,7 +289,9 @@ show_resume() {
   local name="$1" program="$2" id=""
   echo "" >&2; echo "────────────────────────────────────────────" >&2
   case "$program" in
-    codex)  id=$(codex --list-sessions 2>/dev/null | awk 'NR==2{print $1}') ;;
+    # Bug #1 fix: read from filesystem, not `codex --list-sessions` (invalid command).
+    # Bug #2 fix: look in the per-name CODEX_HOME so we get the right agent's session.
+    codex)  id=$(latest_codex_session_id "$(codex_home_for "$name")") ;;
     claude) id=$(ls -t "$HOME/.claude/projects/"*"/"*.jsonl 2>/dev/null | head -1 | xargs basename 2>/dev/null | sed 's/\.jsonl//') ;;
     agy)    id=$(agy --list-sessions 2>/dev/null | awk 'NR==1{print $1}') ;;
   esac
@@ -152,17 +300,26 @@ show_resume() {
   else
     echo "  To resume: agentbus-agent ${name}:${program} --continue" >&2
   fi
+  # Bug #3: show transcript path so you can inspect what the agent did after it exits.
+  if [[ -n "$TRANSCRIPT" && -f "$TRANSCRIPT" ]]; then
+    echo "  Transcript: $TRANSCRIPT" >&2
+  fi
   echo "────────────────────────────────────────────" >&2
 }
 
 # ── run_agent: foreground (render) OR detached (tmux, no render) ───────────────
 # Call with the agent command (everything that goes after `agentbus run ... --`).
+# Bug #3: always pass --transcript so the agent's output is preserved on exit.
+# CODEX_HOME (if set) is exported before this call; it propagates to the PTY via env.
 run_agent() {
   "$AB" start 2>/dev/null || true
+  # Build the transcript flag array (empty if TRANSCRIPT not set yet — shouldn't happen).
+  local tr_flag=()
+  [[ -n "$TRANSCRIPT" ]] && tr_flag=(--transcript "$TRANSCRIPT")
   if [[ $DETACH -eq 1 ]]; then
     local sess; sess="$(sess_name "$NAME")"
     tmux has-session -t "$sess" 2>/dev/null && { echo "error: '$sess' already running — attach: agentbus-agent --attach $NAME" >&2; exit 1; }
-    local cmd; printf -v cmd '%q ' "$AB" run --name "$NAME" --program "$PROGRAM" -- "$@"
+    local cmd; printf -v cmd '%q ' "$AB" run --name "$NAME" --program "$PROGRAM" "${tr_flag[@]}" -- "$@"
     tmux new-session -d -s "$sess" -c "$PWD" "$cmd"
     echo "[agentbus-agent] $NAME ($PROGRAM) detached → tmux '$sess' (not rendered in this terminal)" >&2
     [[ $NO_SEED -eq 0 ]] && { echo "[agentbus-agent] seeding..." >&2; send_seed "$NAME" "$SEED_MSG"; }
@@ -170,10 +327,11 @@ run_agent() {
     echo "  attach:  agentbus-agent --attach $NAME      (then Ctrl-b then d to detach again)" >&2
     echo "  send:    $AB send --from ram --to $NAME --msg-type request \"...\"" >&2
     echo "  stop:    agentbus-agent --kill $NAME" >&2
+    [[ -n "$TRANSCRIPT" ]] && echo "  transcript: $TRANSCRIPT" >&2
   else
     [[ $NO_SEED -eq 0 ]] && ( send_seed "$NAME" "$SEED_MSG" ) &
     echo "[agentbus-agent] $NAME ($PROGRAM) — starting..." >&2
-    "$AB" run --name "$NAME" --program "$PROGRAM" -- "$@"
+    "$AB" run --name "$NAME" --program "$PROGRAM" "${tr_flag[@]}" -- "$@"
     show_resume "$NAME" "$PROGRAM"
   fi
 }
@@ -188,12 +346,14 @@ case "$PROGRAM" in
         --conversation=*) CLAUDE_RESUME=(--resume "${1#--conversation=}"); shift ;;
         --conversation)   CLAUDE_RESUME=(--resume "$2"); shift 2 ;;
         --continue|-c)    CLAUDE_RESUME=(--continue); shift ;;
+        --yolo)           shift ;; # no-op: claude already runs with --dangerously-skip-permissions
         *)                CLAUDE_EXTRA+=("$1"); shift ;;
       esac
     done
     # Persistent empty MCP config (NOT auto-deleted — a detached agent needs it to outlive this script)
     EMPTY_MCP="$HOME/.agentbus/empty-mcp.json"
     mkdir -p "$HOME/.agentbus"; echo '{"mcpServers":{}}' > "$EMPTY_MCP"
+    setup_transcript "$NAME" "claude"
     run_agent claude --dangerously-skip-permissions \
                      --strict-mcp-config --mcp-config "$EMPTY_MCP" \
                      "${CLAUDE_RESUME[@]}" "${CLAUDE_EXTRA[@]}"
@@ -206,13 +366,47 @@ case "$PROGRAM" in
         --conversation=*) CODEX_RESUME_ID="${1#--conversation=}"; shift ;;
         --conversation)   CODEX_RESUME_ID="$2"; shift 2 ;;
         --continue|-c)    CODEX_RESUME_ID="__last__"; shift ;;
+        # Already added automatically below — passing them again makes codex
+        # error with "cannot be used multiple times" (--yolo is an alias).
+        --yolo|--dangerously-bypass-approvals-and-sandbox) shift ;;
         *)                CODEX_EXTRA+=("$1"); shift ;;
       esac
     done
+    # Bug #2: create/reuse a per-name stable CODEX_HOME (auth symlinks + config.toml).
+    # Mirrors the room's launchCodexAgent. Export so the PTY subprocess inherits it.
+    # Exception: when a specific session ID is given, that session lives in the global
+    # ~/.codex (it was created before isolation existed), so use the global home instead.
+    # Detect specific UUID in two ways:
+    #   (a) --conversation <uuid>  → CODEX_RESUME_ID
+    #   (b) positional "resume <uuid>" passed as extra args → scan CODEX_EXTRA
+    _SPECIFIC_ID="$CODEX_RESUME_ID"
+    if [[ -z "$_SPECIFIC_ID" || "$_SPECIFIC_ID" == "__last__" ]]; then
+      for _i in "${!CODEX_EXTRA[@]}"; do
+        if [[ "${CODEX_EXTRA[$_i]}" == "resume" ]]; then
+          _next="${CODEX_EXTRA[$((_i+1))]:-}"
+          if [[ "$_next" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            _SPECIFIC_ID="$_next"; break
+          fi
+        fi
+      done
+    fi
+    if [[ -n "$_SPECIFIC_ID" && "$_SPECIFIC_ID" != "__last__" ]]; then
+      CODEX_HOME_DIR="$HOME/.codex"
+    else
+      CODEX_HOME_DIR="$(setup_codex_home "$NAME" "$PWD")"
+    fi
+    export CODEX_HOME="$CODEX_HOME_DIR"
+    echo "[agentbus-agent] codex CODEX_HOME=$CODEX_HOME_DIR" >&2
+    # Bug #3: transcript co-located with CODEX_HOME sessions for easy post-mortem.
+    setup_transcript "$NAME" "codex" "$CODEX_HOME_DIR"
+    # --all: disables codex's cwd filter when resuming (home is already per-agent isolated,
+    # so cwd filtering would only hide the agent's own session — same fix as the room).
     if [[ -n "$CODEX_RESUME_ID" && "$CODEX_RESUME_ID" != "__last__" ]]; then
-      run_agent codex resume "$CODEX_RESUME_ID" --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
+      run_agent codex resume "$CODEX_RESUME_ID" --all \
+        --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
     elif [[ "$CODEX_RESUME_ID" == "__last__" ]]; then
-      run_agent codex resume --last --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
+      run_agent codex resume --last --all \
+        --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
     else
       run_agent codex --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust "${CODEX_EXTRA[@]}"
     fi
@@ -228,12 +422,61 @@ case "$PROGRAM" in
         *)                GEMINI_EXTRA+=("$1"); shift ;;
       esac
     done
+    setup_transcript "$NAME" "gemini"
     run_agent gemini --yolo --skip-trust --allowed-mcp-server-names __none__ "${GEMINI_RESUME[@]}" "${GEMINI_EXTRA[@]}"
     ;;
 
+  opencode)
+    OPENCODE_RESUME=(); OPENCODE_EXTRA=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --conversation=*) OPENCODE_RESUME=(--session "${1#--conversation=}"); shift ;;
+        --conversation)   OPENCODE_RESUME=(--session "$2"); shift 2 ;;
+        --continue|-c)    OPENCODE_RESUME=(--continue); shift ;;
+        *)                OPENCODE_EXTRA+=("$1"); shift ;;
+      esac
+    done
+    setup_transcript "$NAME" "opencode"
+    run_agent opencode "${OPENCODE_RESUME[@]}" "${OPENCODE_EXTRA[@]}"
+    ;;
+
   agy)
+    setup_transcript "$NAME" "agy"
     # --conversation and --continue are native agy flags — pass through as-is
     run_agent agy --dangerously-skip-permissions "$@"
+    ;;
+
+  qodercli)
+    QODER_RESUME=(); QODER_EXTRA=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --conversation=*) QODER_RESUME=(--resume "${1#--conversation=}"); shift ;;
+        --conversation)   QODER_RESUME=(--resume "$2"); shift 2 ;;
+        --continue|-c)    QODER_RESUME=(--continue); shift ;;
+        *)                QODER_EXTRA+=("$1"); shift ;;
+      esac
+    done
+    setup_transcript "$NAME" "qodercli"
+    run_agent qodercli --dangerously-skip-permissions "${QODER_RESUME[@]}" "${QODER_EXTRA[@]}"
+    ;;
+
+  cmd)
+    # Ram's 'cmd' CLI tool — treated like any other agent binary.
+    setup_transcript "$NAME" "cmd"
+    run_agent cmd "$@"
+    ;;
+
+  exec)
+    # Generic shell adapter — remaining args ARE the command to run.
+    # Usage: agentbus-agent mybot:exec -- python my_agent.py
+    # The entire command is passed through to agentbus run after --.
+    # GenericAdapter (idle=0) injects messages immediately — right for stdin-reading scripts.
+    if [[ $# -eq 0 ]]; then
+      echo "error: exec program requires a command, e.g.: agentbus-agent mybot:exec -- python my_agent.py" >&2
+      exit 1
+    fi
+    setup_transcript "$NAME" "exec"
+    run_agent "$@"
     ;;
 
 esac

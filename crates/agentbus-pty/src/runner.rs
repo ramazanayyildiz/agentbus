@@ -58,7 +58,11 @@ const SCREEN_TAIL_BYTES: usize = 8 * 1024;
 /// source policy later (e.g. rate limit bus injections).
 enum PtyWrite {
     UserStdin(Vec<u8>),
+    /// Body of a bus-injected message (bracketed-paste content, no trailing \r).
     BusMessage(Vec<u8>),
+    /// A deferred Enter (\r) sent ~50ms after BusMessage so the app has time
+    /// to process the paste-end marker before seeing the submit keystroke.
+    BusEnter,
 }
 
 impl PtyRunner {
@@ -188,12 +192,13 @@ impl PtyRunner {
             // spawn_blocking gives us a real OS thread which is appropriate
             // because the underlying PTY writer is a synchronous file handle.
             while let Some(item) = write_rx.blocking_recv() {
-                let bytes = match &item {
+                let bytes: &[u8] = match &item {
                     PtyWrite::UserStdin(b) => b.as_slice(),
                     PtyWrite::BusMessage(b) => {
                         debug!("injecting {} bytes from bus into PTY", b.len());
                         b.as_slice()
                     }
+                    PtyWrite::BusEnter => b"\r",
                 };
                 if let Err(e) = pty_writer_task.write_all(bytes) {
                     warn!("pty write failed: {}", e);
@@ -351,6 +356,7 @@ impl PtyRunner {
                     &screen_tail_for_bus,
                     process_start,
                     idle_threshold,
+                    &agent_name_for_bus,
                 )
                 .await;
                 match res {
@@ -504,6 +510,7 @@ async fn run_bus_loop(
     screen_tail: &Arc<std::sync::Mutex<Vec<u8>>>,
     process_start: Instant,
     idle_threshold: u64,
+    agent_name: &str,
 ) -> InnerExit {
     loop {
         let req = BusRequest::Read {
@@ -534,46 +541,109 @@ async fn run_bus_loop(
                 // When `idle_threshold == 0` (GenericAdapter) we skip the
                 // whole block — behavior is byte-identical to Phase 1/2.
                 if idle_threshold > 0 {
-                    let max_wait = Duration::from_secs(30);
+                    // Hard cap: a never-ready agent still injects eventually (no
+                    // deadlock). Lowered from 30s — see ready_grace below.
+                    let hard_cap = Duration::from_secs(8);
+                    // Once the PTY has gone idle, only wait this long for the
+                    // prompt-ready signal before injecting anyway. Fix for
+                    // full-screen TUIs (Claude) whose absolutely-positioned byte
+                    // stream our line-based `is_prompt_ready` can't reliably parse:
+                    // idle alone is a strong "agent is waiting" signal, so we don't
+                    // burn the full hard cap when readiness never matches. Codex
+                    // (whose box IS detected) still short-circuits on `ready`.
+                    let ready_grace = Duration::from_millis(1000);
                     let started = Instant::now();
+                    let mut idle_since: Option<Instant> = None;
+                    let mut broke_on = "ready";
                     loop {
                         let now_ms = process_start.elapsed().as_millis() as i64;
                         let last_ms = last_output_ms.load(Ordering::Relaxed);
                         let idle_for = now_ms.saturating_sub(last_ms) as u64;
 
                         if idle_for >= idle_threshold {
-                            // Idle gate satisfied — now check prompt readiness.
-                            // Copy + strip ANSI (preserving box glyphs) so the
-                            // adapter sees an approximation of the rendered
-                            // screen tail.
+                            if idle_since.is_none() {
+                                idle_since = Some(Instant::now());
+                            }
+                            // Idle gate satisfied — check prompt readiness on a
+                            // strip-ANSI (box-preserving) approximation of the tail.
                             let ready = {
                                 let raw = screen_tail
                                     .lock()
                                     .map(|t| String::from_utf8_lossy(&t).into_owned())
                                     .unwrap_or_default();
                                 let tail = crate::strip::strip_ansi_preserve_box(&raw);
-                                adapter.is_prompt_ready(&tail)
+                                // Either the line-based prompt box (codex etc.) OR an
+                                // explicit raw OSC "waiting for input" marker (claude).
+                                adapter.is_prompt_ready(&tail) || adapter.ready_marker_in_raw(&raw)
                             };
                             if ready {
+                                broke_on = "ready";
                                 break;
                             }
-                            // Idle but prompt not yet visible (e.g. still in
-                            // boot churn): keep waiting until ready or cap.
+                            // Idle but prompt not detected: inject once the grace
+                            // window since first-idle elapses.
+                            if idle_since.map_or(false, |t| t.elapsed() >= ready_grace) {
+                                broke_on = "idle+grace";
+                                break;
+                            }
+                        } else {
+                            // Output resumed — agent is busy again; reset idle clock.
+                            idle_since = None;
                         }
-                        if started.elapsed() >= max_wait {
-                            debug!(
-                                "idle+ready wait exceeded {:?}; injecting anyway",
-                                max_wait
-                            );
+                        if started.elapsed() >= hard_cap {
+                            broke_on = "hard_cap";
                             break;
                         }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                     }
+                    debug!(
+                        "inject gate: broke_on={} waited={}ms",
+                        broke_on,
+                        started.elapsed().as_millis()
+                    );
                 }
 
-                let bytes = adapter.format_message(&message);
+                // Append a reply hint so the agent always knows how to respond,
+                // even after context compaction or model restart.
+                let mut enriched = message.clone();
+                enriched.body = format!(
+                    "{}\n\nTo reply: agentbus send --from {} --to {} --msg-type response \"your reply here\"",
+                    message.body,
+                    agent_name,
+                    message.from,
+                );
+                let bytes = adapter.format_message(&enriched);
+                let needs_enter = adapter.uses_bracketed_paste();
                 if bus_tx.send(PtyWrite::BusMessage(bytes)).await.is_err() {
                     return InnerExit::Shutdown;
+                }
+                // Bracketed-paste adapters omit the trailing \r from format_message.
+                // Send it as a separate write 500 ms later so the app has time to
+                // process the paste-end marker (\x1b[201~) before seeing Enter.
+                // 500ms: Claude Code collapses large pastes into [Text#1] /
+                // [Pasted Text: N chars] before they're submittable — this
+                // render step takes longer than 200ms for long messages.
+                if needs_enter {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Snapshot output timestamp BEFORE the Enter. A successful submit
+                    // always produces output (the agent starts responding). If the
+                    // Enter doesn't land (message sits unsubmitted at the prompt — the
+                    // "stuck input" failure), no output appears and the snapshot stays
+                    // unchanged. Detect that and re-send Enter once as a recovery tap.
+                    let before = last_output_ms.load(Ordering::Relaxed);
+                    if bus_tx.send(PtyWrite::BusEnter).await.is_err() {
+                        return InnerExit::Shutdown;
+                    }
+                    // Stuck-input guard: wait, and if the agent produced no new output,
+                    // the Enter was swallowed — tap it once more.
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    let after = last_output_ms.load(Ordering::Relaxed);
+                    if after == before {
+                        debug!("stuck-input guard: no output after Enter, re-sending \\r");
+                        if bus_tx.send(PtyWrite::BusEnter).await.is_err() {
+                            return InnerExit::Shutdown;
+                        }
+                    }
                 }
             }
             Ok(BusResponse::Ok { data }) => {

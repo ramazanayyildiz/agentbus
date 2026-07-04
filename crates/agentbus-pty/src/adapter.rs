@@ -32,6 +32,16 @@ pub trait Adapter: Send + Sync {
     /// embedding it.
     fn format_message(&self, msg: &Message) -> Vec<u8>;
 
+    /// Whether this adapter wraps the message in a bracketed-paste envelope
+    /// (`\x1b[200~…\x1b[201~`). When true, `format_message` does NOT append
+    /// a trailing `\r`; instead the runner sends a separate `BusEnter` write
+    /// 50 ms later so the app has time to process the paste-end marker before
+    /// seeing the submit keystroke. GenericAdapter (and anything using
+    /// `format_for_injection`) returns false and includes its own `\r`.
+    fn uses_bracketed_paste(&self) -> bool {
+        false
+    }
+
     /// Minimum idle time (ms) the PTY output stream must show before this
     /// adapter is willing to inject a message. Phase 3 uses this as a
     /// universal "the agent isn't actively producing output right now"
@@ -59,6 +69,17 @@ pub trait Adapter: Send + Sync {
     /// `lib/msgfmt/agent_readiness.go` + `lib/msgfmt/message_box.go`.
     fn is_prompt_ready(&self, _screen_tail: &str) -> bool {
         true
+    }
+
+    /// Readiness check against the RAW (un-stripped) screen tail.
+    ///
+    /// Some agents announce "idle, waiting for input" via an OSC escape whose
+    /// payload `strip_ansi_preserve_box` discards (it removes the whole
+    /// `ESC ] … BEL`). For those, line-based `is_prompt_ready` on the stripped
+    /// tail can't see the signal, so the runner ALSO calls this on the raw bytes
+    /// and injects if EITHER returns true. Default: `false`.
+    fn ready_marker_in_raw(&self, _raw_screen_tail: &str) -> bool {
+        false
     }
 }
 
@@ -95,6 +116,8 @@ impl Adapter for ClaudeAdapter {
         "claude"
     }
 
+    fn uses_bracketed_paste(&self) -> bool { true }
+
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         bracketed_paste_envelope(msg)
     }
@@ -114,6 +137,20 @@ impl Adapter for ClaudeAdapter {
     fn is_prompt_ready(&self, screen_tail: &str) -> bool {
         strip::has_greater_than_or_slim_box(screen_tail)
     }
+
+    /// Claude Code emits an OSC notify when it settles idle at the prompt:
+    ///   ESC ] 777;notify;…{"event":"idle_prompt",…,"summary":"Claude is waiting
+    ///   for your input"} BEL
+    /// Its absolutely-positioned full-screen TUI defeats the line-based
+    /// `has_greater_than_or_slim_box` check (the rendered prompt never lands as a
+    /// clean trailing line), so without this the idle gate always falls through to
+    /// the grace/cap. This explicit "waiting for input" signal is reliable; we
+    /// match it on the RAW tail because `strip_ansi_preserve_box` drops the OSC
+    /// payload. Combined with the runner's idle gate (only checked once the PTY is
+    /// quiet), a stale marker from a prior turn can't fire mid-response.
+    fn ready_marker_in_raw(&self, raw_screen_tail: &str) -> bool {
+        raw_screen_tail.contains("\"event\":\"idle_prompt\"")
+    }
 }
 
 /// Codex adapter. Behavior identical to Claude's for now (same input model:
@@ -125,6 +162,8 @@ impl Adapter for CodexAdapter {
     fn name(&self) -> &'static str {
         "codex"
     }
+
+    fn uses_bracketed_paste(&self) -> bool { true }
 
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         bracketed_paste_envelope(msg)
@@ -152,6 +191,8 @@ impl Adapter for OpencodeAdapter {
     fn name(&self) -> &'static str {
         "opencode"
     }
+
+    fn uses_bracketed_paste(&self) -> bool { true }
 
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         bracketed_paste_envelope(msg)
@@ -187,6 +228,8 @@ impl Adapter for AgyAdapter {
         "agy"
     }
 
+    fn uses_bracketed_paste(&self) -> bool { true }
+
     fn format_message(&self, msg: &Message) -> Vec<u8> {
         bracketed_paste_envelope(msg)
     }
@@ -205,6 +248,32 @@ impl Adapter for AgyAdapter {
         }
         // Fall back to the same `>` / slim-box pattern as ClaudeAdapter.
         strip::has_greater_than_or_slim_box(screen_tail)
+    }
+}
+
+/// QoderCLI adapter.
+///
+/// Qodercli (`qodercli`) is a Claude Code-style coding agent with an
+/// interactive TUI and similar conventions (`--dangerously-skip-permissions`,
+/// `--continue`, `--resume`, `--system-prompt`).  We don't yet have a reliable
+/// prompt-box marker, so we fall back to the idle gate (750 ms, same as agy).
+/// bracketed-paste is used for delivery since qodercli's TUI reads paste
+/// sequences the same way claude/codex do.
+pub struct QoderCliAdapter;
+
+impl Adapter for QoderCliAdapter {
+    fn name(&self) -> &'static str {
+        "qodercli"
+    }
+
+    fn uses_bracketed_paste(&self) -> bool { true }
+
+    fn format_message(&self, msg: &Message) -> Vec<u8> {
+        bracketed_paste_envelope(msg)
+    }
+
+    fn idle_ms_before_inject(&self) -> u64 {
+        750
     }
 }
 
@@ -251,6 +320,11 @@ pub fn pick(program: &str) -> Box<dyn Adapter> {
         Box::new(AgyAdapter)
     } else if p.contains("aider") {
         Box::new(AiderAdapter)
+    } else if p.contains("qodercli") || p.contains("qoder") {
+        Box::new(QoderCliAdapter)
+    } else if p == "cmd" || p.contains("qwen") {
+        // Ram's 'cmd' (commandcode) and qwen/qwencli — Claude Code-style TUI.
+        Box::new(ClaudeAdapter)
     } else {
         Box::new(GenericAdapter)
     }
@@ -282,7 +356,10 @@ fn bracketed_paste_envelope(msg: &Message) -> Vec<u8> {
     out.extend_from_slice(b"\x1b[200~");
     out.extend_from_slice(line.as_bytes());
     out.extend_from_slice(b"\x1b[201~");
-    out.push(b'\r');
+    // NOTE: \r (Enter) is intentionally NOT appended here.
+    // The runner sends it as a separate write after a brief flush-gap so the
+    // app has time to process the paste-end marker before seeing Enter.
+    // See runner.rs BusMessage handling.
     out
 }
 
@@ -315,15 +392,24 @@ mod tests {
         assert_eq!(pick("/usr/local/bin/opencode --tui").name(), "opencode");
         assert_eq!(pick("agy").name(), "agy");
         assert_eq!(pick("/usr/local/bin/agy --dangerously-skip-permissions").name(), "agy");
+        assert_eq!(pick("qodercli").name(), "qodercli");
+        assert_eq!(pick("qodercli --dangerously-skip-permissions").name(), "qodercli");
         assert_eq!(pick("vim").name(), "generic");
+        // cmd: no match → generic (inject immediately, perfect for arbitrary scripts)
+        assert_eq!(pick("cmd").name(), "claude"); // commandcode CLI — Claude Code-style TUI
+        assert_eq!(pick("qwen").name(), "claude"); // qwen runs Claude Code TUI
+        assert_eq!(pick("qwencli").name(), "claude");
+        assert_eq!(pick("python").name(), "generic");
+        assert_eq!(pick("bash").name(), "generic");
     }
 
     #[test]
     fn opencode_uses_bracketed_paste_and_idle_gating() {
         let bytes = OpencodeAdapter.format_message(&msg("hi"));
         assert!(bytes.starts_with(b"\x1b[200~"));
-        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
-        assert_eq!(bytes.last(), Some(&b'\r'));
+        // Must end with paste-end marker (no trailing \r — runner sends BusEnter separately)
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert!(OpencodeAdapter.uses_bracketed_paste());
         assert_eq!(OpencodeAdapter.idle_ms_before_inject(), 750);
     }
 
@@ -331,8 +417,9 @@ mod tests {
     fn claude_adapter_uses_bracketed_paste() {
         let bytes = ClaudeAdapter.format_message(&msg("hello"));
         assert!(bytes.starts_with(b"\x1b[200~"));
-        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
-        assert_eq!(bytes.last(), Some(&b'\r'));
+        // Must end with paste-end marker (no trailing \r — runner sends BusEnter separately)
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert!(ClaudeAdapter.uses_bracketed_paste());
     }
 
     #[test]
@@ -353,6 +440,19 @@ mod tests {
     fn case_insensitive_matching() {
         assert_eq!(pick("CLAUDE").name(), "claude");
         assert_eq!(pick("Codex").name(), "codex");
+    }
+
+    #[test]
+    fn claude_ready_marker_detects_idle_prompt_osc() {
+        // Claude's raw idle notify (OSC payload survives only in the RAW tail).
+        let raw = "...some output...\u{1b}]777;notify;warp://cli-agent;{\"v\":1,\"agent\":\"claude\",\"event\":\"idle_prompt\",\"summary\":\"Claude is waiting for your input\"}\u{07}";
+        assert!(ClaudeAdapter.ready_marker_in_raw(raw));
+        // No marker → false (must fall through to idle gate, not fire early).
+        assert!(!ClaudeAdapter.ready_marker_in_raw("just streaming response text"));
+        // A different OSC event must NOT count as ready.
+        assert!(!ClaudeAdapter.ready_marker_in_raw("\u{1b}]777;notify;x;{\"event\":\"running\"}\u{07}"));
+        // Other adapters default to no raw marker.
+        assert!(!CodexAdapter.ready_marker_in_raw("\"event\":\"idle_prompt\""));
     }
 
     #[test]
@@ -472,8 +572,9 @@ codex ran tests, all green.
     fn agy_uses_bracketed_paste_and_idle_gating() {
         let bytes = AgyAdapter.format_message(&msg("hi"));
         assert!(bytes.starts_with(b"\x1b[200~"));
-        assert!(bytes.windows(6).any(|w| w == b"\x1b[201~"));
-        assert_eq!(bytes.last(), Some(&b'\r'));
+        // Must end with paste-end marker (no trailing \r — runner sends BusEnter separately)
+        assert!(bytes.ends_with(b"\x1b[201~"));
+        assert!(AgyAdapter.uses_bracketed_paste());
         assert_eq!(AgyAdapter.idle_ms_before_inject(), 750);
     }
 }

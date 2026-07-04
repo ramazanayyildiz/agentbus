@@ -455,6 +455,20 @@ impl Database {
         Ok(n)
     }
 
+    /// Return the names of all agents currently in the `active` state.
+    /// Used by the daemon's periodic ghost sweep.
+    pub fn list_active_agents(&self) -> anyhow::Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM agents WHERE state = ?1")?;
+        let names = stmt
+            .query_map(rusqlite::params![AgentState::Active.as_str()], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
     pub fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, program, model, project, state, pid, registered_at

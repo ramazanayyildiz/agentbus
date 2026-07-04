@@ -94,6 +94,47 @@ async fn main() -> anyhow::Result<()> {
     // Map of connected agents: agent_name → message channel
     let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
 
+    // Periodic ghost sweep: every 30s mark any DB-active agent whose socket
+    // is gone from the clients map as disconnected. Catches runners that died
+    // from SIGKILL or any path that didn't cleanly close the socket before
+    // the daemon could process the EOF.
+    {
+        let clients_sweep = Arc::clone(&clients);
+        let db_sweep = Arc::clone(&db);
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(30);
+            loop {
+                tokio::time::sleep(interval).await;
+                // Collect names that have a live socket right now.
+                let connected: std::collections::HashSet<String> = {
+                    clients_sweep.lock().await.keys().cloned().collect()
+                };
+                // Ask DB for all active agents.
+                let active = db_call(&db_sweep, |d| d.list_active_agents()).await;
+                match active {
+                    Ok(names) => {
+                        let ghosts: Vec<String> = names
+                            .into_iter()
+                            .filter(|n| !connected.contains(n))
+                            .collect();
+                        if !ghosts.is_empty() {
+                            info!("ghost sweep: {} stale active agent(s) found: {:?}", ghosts.len(), ghosts);
+                        }
+                        for name in ghosts {
+                            let n = name.clone();
+                            if let Err(e) = db_call(&db_sweep, move |d| d.mark_disconnected(&n)).await {
+                                warn!("ghost sweep: failed to mark '{}' disconnected: {}", name, e);
+                            } else {
+                                info!("ghost sweep: marked '{}' as disconnected", name);
+                            }
+                        }
+                    }
+                    Err(e) => warn!("ghost sweep: list_active_agents failed: {}", e),
+                }
+            }
+        });
+    }
+
     // Handle SIGTERM/SIGINT for graceful shutdown
     let sock_path_clone = sock_path.clone();
     let pid_path_clone = pid_path.clone();
@@ -260,13 +301,18 @@ where
                             db_call(db, move |d| d.release_all_claims_for(&name_release)).await;
                         let name_disc = name.clone();
                         let _ = db_call(db, move |d| d.mark_disconnected(&name_disc)).await;
-                        info!("Agent {} disconnected", name);
+                        warn!(
+                            "Agent '{}' disconnected (in-loop EOF: client closed socket). DB marked Disconnected, claims released.",
+                            name
+                        );
                     } else {
                         info!(
-                            "Agent {} reachability/short connection ended (slot owned by another connection — leaving map untouched)",
+                            "Agent '{}': reachability/short connection ended; slot owned by another connection — leaving map untouched (no DB change)",
                             name
                         );
                     }
+                } else {
+                    info!("Connection closed before any Register (EOF without registration)");
                 }
                 return Ok(LoopOutcome::Exit);
             }
@@ -307,10 +353,20 @@ where
         // === Branch 2: pushed message from another agent ===
         maybe_msg = pushed => {
             let Some(msg) = maybe_msg else {
-                // Sender dropped — other end of the channel is gone.
-                // Clear our receiver so the branch becomes pending again.
-                *rx = None;
-                return Ok(LoopOutcome::Continue);
+                // Push channel closed = we were evicted. A fresh Register
+                // for the same name dropped our tx in the clients map (see
+                // Register handler). Continuing the loop with rx=None made
+                // the next Read{wait} fall into the `rx is None` branch
+                // and return "Not registered" — which the wrapper logged
+                // every 500ms forever. Instead, exit this connection
+                // cleanly: the eviction-aware cleanup leaves the new
+                // owner's state intact, the wrapper sees EOF on its old
+                // socket, and its outer reconnect loop opens a fresh
+                // connection and Re-Registers.
+                if let Some(ref name) = agent_name {
+                    info!("Connection for {} evicted by reattach — closing", name);
+                }
+                return Ok(LoopOutcome::Exit);
             };
 
             // Deliver-then-mark-read (Issue 1). If the write fails, we
@@ -381,6 +437,10 @@ async fn handle_client(
     // eviction-aware check below is the same one used in the in-loop
     // EOF path; see the long-form comment there.
     let we_were_evicted = rx.as_ref().map(|r| r.is_closed()).unwrap_or(false);
+    let exit_kind = match &result {
+        Ok(()) => "clean".to_string(),
+        Err(e) => format!("error: {}", e),
+    };
     if let Some(name) = agent_name.as_ref() {
         if !we_were_evicted {
             {
@@ -391,13 +451,21 @@ async fn handle_client(
             let _ = db_call(&db, move |d| d.release_all_claims_for(&name_clone)).await;
             let name_disc = name.clone();
             let _ = db_call(&db, move |d| d.mark_disconnected(&name_disc)).await;
-            info!("Agent {} cleanup complete (handle_client exit)", name);
+            warn!(
+                "Agent '{}' cleanup complete (handle_client exit, kind={}). DB marked Disconnected, claims released.",
+                name, exit_kind
+            );
         } else {
             info!(
-                "Agent {} handle_client exit while evicted — slot left intact",
-                name
+                "Agent '{}' handle_client exit while evicted (kind={}) — slot left intact, no DB change",
+                name, exit_kind
             );
         }
+    } else {
+        info!(
+            "handle_client exit without ever registering (kind={})",
+            exit_kind
+        );
     }
 
     result
@@ -455,19 +523,23 @@ async fn dispatch_request<W: MessageWriter>(
                 Ok(agent) => {
                     let (tx, rx_new) = mpsc::channel(PUSH_CHANNEL_CAPACITY);
                     let mut map = clients.lock().await;
-                    if let Some(old_tx) = map.remove(&name) {
-                        // Drop the old sender; the previous connection's
-                        // receiver wakes up with None and the runner /
-                        // bus_to_pty task treats it as connection lost.
-                        drop(old_tx);
-                        info!("evicted previous connection for '{}' (reattach)", name);
+                    let evicted = map.remove(&name).is_some();
+                    if evicted {
+                        warn!(
+                            "Register('{}'): evicting previous connection (reattach). Old conn's push channel closed; it will exit on next iter.",
+                            name
+                        );
                     }
                     map.insert(name.clone(), tx);
+                    let map_size = map.len();
                     drop(map);
 
                     *agent_name = Some(name.clone());
                     *rx = Some(rx_new);
-                    info!("Agent {} claimed by connection", name);
+                    info!(
+                        "Register OK: '{}' (program={}, model={}, project={}, evicted_prev={}, clients_map_size={})",
+                        name, program, model, project, evicted, map_size
+                    );
 
                     BusResponse::Ok {
                         data: serde_json::to_value(&agent)?,
@@ -619,6 +691,10 @@ async fn dispatch_request<W: MessageWriter>(
 
         BusRequest::Read { wait, timeout_secs } => {
             let Some(name) = agent_name.clone() else {
+                warn!(
+                    "Read on connection that never Registered (wait={:?}, timeout_secs={:?}) — returning 'Not registered'",
+                    wait, timeout_secs
+                );
                 return Ok(Some(BusResponse::Error {
                     message: "Not registered".to_string(),
                 }));
@@ -669,6 +745,10 @@ async fn dispatch_request<W: MessageWriter>(
                     }
 
                     let Some(ref mut receiver) = rx else {
+                        warn!(
+                            "Read{{wait}} on '{}' but rx is None (connection state lost — likely evicted but loop didn't exit). Returning 'Not registered'.",
+                            name
+                        );
                         return Ok(Some(BusResponse::Error {
                             message: "Not registered".to_string(),
                         }));
